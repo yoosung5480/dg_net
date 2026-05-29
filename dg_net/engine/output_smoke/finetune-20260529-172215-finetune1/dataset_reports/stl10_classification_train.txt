@@ -1,0 +1,9 @@
+dataset: STL10
+training_type: classification
+split: train
+data_path: /home/jeongyuseong/바탕화면/datasets
+resolved_data_path: /home/jeongyuseong/바탕화면/datasets/stl10/train
+samples: 4
+batch_size: 2
+sampler: RandomSampler
+batch_sample: shape=(2, 3, 32, 32), dtype=torch.float32, min=0.0000, max=0.9922
