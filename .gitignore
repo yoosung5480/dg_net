@@ -1,0 +1,117 @@
+# =========================================================
+# Common GitHub / Python / ML Project .gitignore Template
+# =========================================================
+
+# -------------------------
+# Python cache / build files
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+venv/
+env/
+ENV/
+conda-env/
+.env
+
+# -------------------------
+# Jupyter Notebook
+# -------------------------
+.ipynb_checkpoints/
+
+# -------------------------
+# IDE / OS files
+# -------------------------
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Logs
+# -------------------------
+logs/
+*.log
+
+# -------------------------
+# Model checkpoints / weights
+# -------------------------
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+
+checkpoints/
+weights/
+runs/
+outputs/
+output/
+artifacts/
+
+# -------------------------
+# Dataset / data files
+# -------------------------
+data/
+datasets/
+
+*.csv
+*.tsv
+*.json
+*.jsonl
+*.parquet
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# -------------------------
+# Large media files
+# -------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.mp3
+*.wav
+
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.webp
+
+# -------------------------
+# Large files over 100MB
+# -------------------------
+# .gitignore cannot ignore files by size.
+# GitHub blocks files larger than 100MB.
+# Use Git LFS for large files if they must be versioned.

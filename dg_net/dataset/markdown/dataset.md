@@ -9,7 +9,7 @@ loader = prepare_dataloader(cfg)
 ```
 
 # *_train.py 공통요구사항
-데이터셋 경로 : `/home/jeongyuseong/바탕화면/datasets`
+데이터셋 경로 : `/home/cv202355545/dataset`
 
 ###  input
 Config를 통해서 모든것이 생성되고 제어돼야한다.

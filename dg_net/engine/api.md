@@ -24,7 +24,7 @@ python dg_train.py \
   --validate-every-steps 50 \
   --save-every-steps 100 \
   --dataset STL10 \
-  --data-path /home/jeongyuseong/바탕화면/datasets \
+  --data-path /home/cv202355545/dataset \
   --img-size 32 \
   --batch-size 4 \
   --num-workers 0 \

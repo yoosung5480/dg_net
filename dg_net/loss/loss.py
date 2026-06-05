@@ -59,7 +59,7 @@ class DegradationTargetDistance(nn.Module):
         self.tau_deg = tau_deg
 
     def forward(self, reconstruction_distance: Tensor) -> Tensor:
-        return (reconstruction_distance - self.tau_deg).square()
+        return (reconstruction_distance - self.tau_deg).abs()
 
 
 class MaskBudgetDistance(nn.Module):

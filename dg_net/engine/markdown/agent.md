@@ -310,7 +310,7 @@ SSL pretraining loader:
 cfg = DataConfig(
     dataset="STL10",
     mode="ssl",
-    data_path="/home/jeongyuseong/바탕화면/datasets",
+    data_path="/home/cv202355545/dataset",
     ssl_num_views=2,
     img_size=32,
     batch_size=4,
@@ -583,7 +583,7 @@ python dg_train.py \
   --validate-every-steps 50 \
   --save-every-steps 100 \
   --dataset STL10 \
-  --data-path /home/jeongyuseong/바탕화면/datasets \
+  --data-path /home/cv202355545/dataset \
   --img-size 32 \
   --batch-size 4 \
   --num-workers 0 \
@@ -614,7 +614,7 @@ python dg_train.py \
   --validate-every-epochs 1 \
   --save-every-epochs 1 \
   --dataset STL10 \
-  --data-path /home/jeongyuseong/바탕화면/datasets \
+  --data-path /home/cv202355545/dataset \
   --img-size 32 \
   --batch-size 4 \
   --num-workers 0 \

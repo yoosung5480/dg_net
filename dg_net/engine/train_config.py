@@ -85,7 +85,7 @@ class TrainConfig:
 
     # Dataset
     dataset: str = "STL10"
-    data_path: str = "/home/jeongyuseong/바탕화면/datasets"
+    data_path: str = "/home/cv202355545/dataset"
     split: str = "train"
     val_split: Optional[str] = None
     download: bool = False
@@ -328,7 +328,7 @@ def build_arg_parser(default_task: str = "dg_pretrain") -> argparse.ArgumentPars
     _add_bool_arg(parser, "deterministic", False, "deterministic backend settings")
     parser.add_argument("--device", default="auto")
 
-    parser.add_argument("--data-path", default="/home/jeongyuseong/바탕화면/datasets")
+    parser.add_argument("--data-path", default="/home/cv202355545/dataset")
     parser.add_argument("--dataset", default="STL10")
     parser.add_argument("--split", default="train")
     parser.add_argument("--val-split", default=None)

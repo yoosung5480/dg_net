@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-DATA_PATH="${DATA_PATH:-/home/jeongyuseong/바탕화면/datasets}"
+DATA_PATH="${DATA_PATH:-/home/cv202355545/dataset}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-output}"
 DEVICE="${DEVICE:-auto}"
 NUM_WORKERS="${NUM_WORKERS:-4}"

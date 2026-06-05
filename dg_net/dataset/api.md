@@ -19,7 +19,7 @@ from dataset import DataConfig, inspect_loader, prepare_dataloader
 cfg = DataConfig(
     dataset="STL10",
     mode="ssl",
-    data_path="/home/jeongyuseong/바탕화면/datasets",
+    data_path="/home/cv202355545/dataset",
     img_size=32,
     batch_size=4,
     num_workers=0,
@@ -127,7 +127,7 @@ STL10만 프로젝트의 공유 dataset 디렉터리 관례를 추가 지원한�
 모두 두는 것이다.
 
 ```text
-/home/jeongyuseong/바탕화면/datasets/
+/home/cv202355545/dataset/
 └── stl10/
     └── stl10_binary/
         ├── unlabeled_X.bin
@@ -142,7 +142,7 @@ STL10만 프로젝트의 공유 dataset 디렉터리 관례를 추가 지원한�
 cfg = DataConfig(
     dataset="STL10",
     mode="ssl",
-    data_path="/home/jeongyuseong/바탕화면/datasets/stl10",
+    data_path="/home/cv202355545/dataset/stl10",
     download=False,
 )
 ```
@@ -152,7 +152,7 @@ cfg = DataConfig(
 파일이 들어 있어야 한다.
 
 ```text
-/home/jeongyuseong/바탕화면/datasets/
+/home/cv202355545/dataset/
 └── stl10/
     ├── train/stl10_binary/   # SSL unlabeled 또는 classification train을 읽을 root
     └── val/stl10_binary/     # classification test를 읽을 root로 사용할 때
@@ -168,7 +168,7 @@ cfg = DataConfig(
     dataset="Flowers102",
     mode="classification",
     split="validation",       # 내부에서 "val"로 변환
-    data_path="/home/jeongyuseong/바탕화면/datasets",
+    data_path="/home/cv202355545/dataset",
     download=False,           # 이미 torchvision 형식으로 준비되어 있을 때
 )
 loader = prepare_dataloader(cfg)
@@ -187,7 +187,7 @@ loader = prepare_dataloader(cfg)
 | 필드 | 기본값 | 설명 |
 | --- | --- | --- |
 | `dataset` | `"STL10"` | 지원 dataset 이름. 대소문자는 정규화되며 iNaturalist는 `"inat"` 별칭도 지원한다. |
-| `data_path` | `"/home/jeongyuseong/바탕화면/datasets"` | torchvision root 또는 위 STL10 탐색 규칙의 기준 root |
+| `data_path` | `"/home/cv202355545/dataset"` | torchvision root 또는 위 STL10 탐색 규칙의 기준 root |
 | `mode` | `"ssl"` | `"ssl"` 또는 `"classification"` |
 | `split` | `"train"` | classification split 선택. STL10 SSL에서는 무시되고 unlabeled를 사용한다. |
 | `download` | `False` | 없는 dataset을 torchvision이 다운로드하도록 할지 여부 |
@@ -278,7 +278,7 @@ from dataset import DataConfig, prepare_dataloader
 cfg = DataConfig(
     dataset="STL10",
     mode="ssl",
-    data_path="/home/jeongyuseong/바탕화면/datasets",
+    data_path="/home/cv202355545/dataset",
     img_size=224,
     ssl_num_views=2,
     batch_size=64,
@@ -307,7 +307,7 @@ cfg = DataConfig(
     dataset="CIFAR100",
     mode="classification",
     split="test",
-    data_path="/home/jeongyuseong/바탕화면/datasets",
+    data_path="/home/cv202355545/dataset",
     img_size=224,
     use_augmentation=False,
     batch_size=128,
@@ -330,7 +330,7 @@ cfg = DataConfig(
     dataset="Flowers102",
     mode="classification",
     split="train",
-    data_path="/home/jeongyuseong/바탕화면/datasets",
+    data_path="/home/cv202355545/dataset",
     classes=[0, 1, 2],
     max_samples=32,
     seed=123,
@@ -356,7 +356,7 @@ from dataset import DataConfig, prepare_dataloader
 cfg = DataConfig(
     dataset="STL10",
     mode="ssl",
-    data_path="/home/jeongyuseong/바탕화면/datasets",
+    data_path="/home/cv202355545/dataset",
     distributed=True,
     rank=0,
     world_size=2,

@@ -178,7 +178,7 @@ from loss_config import LossConfig
 
 data_cfg = DataConfig(
     dataset="STL10", mode="ssl",
-    data_path="/home/jeongyuseong/바탕화면/datasets",
+    data_path="/home/cv202355545/dataset",
     max_samples=400, img_size=32, use_augmentation=False,
     batch_size=4, num_workers=0, drop_last=True, pin_memory=False,
 )

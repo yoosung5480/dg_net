@@ -38,7 +38,7 @@ DataConfig 사용 설명
 필드별 사용법
 -------------
 * ``data_path``: 데이터 저장 상위 디렉터리. 본 프로젝트의 공통 경로
-  ``/home/jeongyuseong/바탕화면/datasets``를 넣으면 STL10의 경우
+  ``/home/cv202355545/dataset``를 넣으면 STL10의 경우
   ``stl10/train/stl10_binary`` 또는 평가용 하위 경로를 자동 탐색한다.
 * ``download``: torchvision에 없는 파일을 다운로드할지 결정한다. 서버/오프라인
   환경에서는 이미 준비된 데이터와 ``False`` 사용을 권장한다.
