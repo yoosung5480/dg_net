@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import NamedTuple, Tuple
 
 from PIL import Image, ImageDraw
 import torch
@@ -312,8 +312,7 @@ class DegradationGenerator(nn.Module):
         return unpatchify(residual_patches, self.patch_size, self.in_chans, self.grid_size)
 
 
-@dataclass
-class DgNetOutput:
+class DgNetOutput(NamedTuple):
     """Named forward values used by adversarial reconstruction training."""
 
     original: torch.Tensor

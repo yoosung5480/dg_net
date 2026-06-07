@@ -23,9 +23,13 @@ from loss.loss import write_loss_report  # noqa: E402
 DG_COLUMNS = [
     "run_id", "task", "loop_mode", "epoch", "step", "split", "phase",
     "train_loss", "validation_loss", "validation_score", "inference_loss",
-    "degradation_loss", "reconstruction_distance", "target_distance",
-    "mask_budget_distance", "damage_kl", "alpha_inference", "alpha_target",
-    "lambda_budget", "lambda_reg", "lr_inference", "lr_degradation", "elapsed_sec",
+    "degradation_loss", "combined_loss", "inference_rec", "inference_rep",
+    "dg_target", "dg_budget", "dg_kl", "dg_rep", "dg_sparse",
+    "weighted_inference_rec", "weighted_inference_rep", "weighted_dg_target",
+    "weighted_dg_budget", "weighted_dg_kl", "weighted_dg_rep", "weighted_dg_sparse",
+    "weight_inference_rec", "weight_inference_rep", "weight_dg_target", "weight_dg_budget",
+    "weight_dg_kl", "weight_dg_rep", "weight_dg_sparse",
+    "lr_inference", "lr_degradation", "elapsed_sec",
 ]
 
 CLASS_COLUMNS = [
@@ -97,9 +101,9 @@ def evaluate_dgnet(
         values = loss_fn(output, step=step or 0)
         metrics = values.metrics()
         metrics["validation_loss"] = metrics.get("combined_loss", math.nan)
-        rec = metrics.get("reconstruction_distance", math.nan)
-        budget = metrics.get("budget_distance", math.nan)
-        target = metrics.get("target_distance", math.nan)
+        rec = metrics.get("inference_rec", math.nan)
+        budget = metrics.get("dg_budget", math.nan)
+        target = metrics.get("dg_target", math.nan)
         score_denominator = 1.0 + finite_or_nan(rec) + finite_or_nan(budget) + finite_or_nan(target)
         metrics["validation_score"] = 1.0 / score_denominator if math.isfinite(score_denominator) else math.nan
         for key, value in metrics.items():
@@ -111,8 +115,6 @@ def evaluate_dgnet(
         return {"validation_loss": math.nan, "validation_score": math.nan}
     averaged = {key: value / count for key, value in totals.items()}
     # Normalize public CSV naming.
-    if "budget_distance" in averaged:
-        averaged["mask_budget_distance"] = averaged["budget_distance"]
     averaged.setdefault("validation_loss", averaged.get("combined_loss", math.nan))
     averaged.setdefault("validation_score", math.nan)
     return averaged

@@ -92,6 +92,7 @@ trainer.run()
 --use-augmentation / --no-use-augmentation
 --checkpoint --resume
 ```
+그 외 모델 훈련 주요 외부선언 가능 인자들은 `dg_net/engine/train_config.py`를 보고 참고한다.
 
 ## DGNet pretraining loop
 

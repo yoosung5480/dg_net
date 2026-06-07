@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover - direct-script compatibility
     from dataset_config import DataConfig
 
 
-SUPPORTED_DATASETS = ("STL10", "CIFAR100", "Flowers102", "iNaturalist")
+SUPPORTED_DATASETS = ("STL10", "CIFAR100", "Flowers102", "iNaturalist", "Synthetic")
 SUPPORTED_MODES = ("ssl", "classification")
 _DATASET_NAMES = {name.lower(): name for name in SUPPORTED_DATASETS}
 _DATASET_NAMES["inat"] = "iNaturalist"
@@ -64,8 +64,8 @@ def validate_config(cfg: DataConfig) -> Tuple[str, str]:
 
     name = _canonical_dataset(cfg.dataset)
     mode = _canonical_mode(cfg.mode)
-    if mode == "ssl" and name != "STL10":
-        raise ValueError("SSL mode currently supports STL10 only (unlabeled pretraining split).")
+    if mode == "ssl" and name not in {"STL10", "Synthetic"}:
+        raise ValueError("SSL mode currently supports STL10 only (Synthetic is reserved for smoke tests).")
     if cfg.batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     if cfg.num_workers < 0:
@@ -212,7 +212,16 @@ def prepare_dataset(cfg: DataConfig) -> Dataset[Any]:
     name, mode = validate_config(cfg)
     transform = build_transform(cfg, mode)
     root = _resolve_root(cfg, name, mode)
-    if name == "STL10":
+    if name == "Synthetic":
+        split = "synthetic_ssl" if mode == "ssl" else cfg.split
+        dataset = datasets.FakeData(
+            size=cfg.max_samples or 128,
+            image_size=(3, cfg.img_size, cfg.img_size),
+            num_classes=10,
+            transform=transform,
+            random_offset=cfg.seed + (0 if split == "train" else 1000),
+        )
+    elif name == "STL10":
         split = "unlabeled" if mode == "ssl" else cfg.split
         dataset = datasets.STL10(root=root, split=split, download=cfg.download, transform=transform)
     elif name == "CIFAR100":

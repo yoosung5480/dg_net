@@ -12,6 +12,8 @@ import traceback
 from typing import Any
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 ENGINE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = ENGINE_DIR.parent
@@ -39,6 +41,14 @@ class DGTrainer:
     def __init__(self, cfg: TrainConfig) -> None:
         self.cfg = cfg
         self.cfg.task = "dg_pretrain"
+        if cfg.distributed:
+            if not torch.cuda.is_available():
+                raise RuntimeError("DDP training requires CUDA/NCCL.")
+            torch.cuda.set_device(cfg.local_rank)
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            cfg.local_rank = int(dist.get_rank() if "LOCAL_RANK" not in __import__("os").environ else cfg.local_rank)
+            cfg.rank, cfg.world_size = dist.get_rank(), dist.get_world_size()
         self.cfg.seed_everything()
         self.device = cfg.resolve_device()
         self.output_dir = cfg.prepare_output_dir()
@@ -49,8 +59,9 @@ class DGTrainer:
         self.epoch = 0
         self.best_validation_score = -math.inf
 
-        self.cfg.write_json(self.output_dir / "config.json")
-        self.logger.info("DGNet pretraining started")
+        if self.is_rank0:
+            self.cfg.write_json(self.output_dir / "config.json")
+        self.logger.info("DGNet pretraining started rank=%d world_size=%d", cfg.rank, cfg.world_size)
         self.logger.info("device=%s torch=%s cuda_available=%s", self.device, torch.__version__, torch.cuda.is_available())
         self.logger.info("config=%s", json.dumps(self.cfg.to_dict(), ensure_ascii=False, default=str))
 
@@ -59,46 +70,71 @@ class DGTrainer:
         self.logger.info("train_loader: %s", inspect_loader(self.train_loader, mode="ssl"))
         self.logger.info("val_loader: %s", inspect_loader(self.val_loader, mode="ssl"))
 
-        self.model = DGNet(cfg.build_model_config()).to(self.device)
+        raw_model = DGNet(cfg.build_model_config()).to(self.device)
         if cfg.checkpoint:
-            self.model = DGNet.load(cfg.checkpoint, map_location=self.device, verbose=False).to(self.device)
+            raw_model = DGNet.load(cfg.checkpoint, map_location=self.device, verbose=False).to(self.device)
+        self.model = raw_model
+        if cfg.checkpoint:
             self._check_model_config()
             self.logger.info("loaded pretrained DGNet from %s", cfg.checkpoint)
         self.loss_fn = prepare_dgloss(cfg.build_loss_config()).to(self.device)
         self.optimizer_i = torch.optim.AdamW(
-            list(self.model.encoder.parameters()) + list(self.model.decoder.parameters()) + list(self.model.projection.parameters()),
+            list(raw_model.encoder.parameters()) + list(raw_model.decoder.parameters()) + list(raw_model.projection.parameters()),
             lr=cfg.lr_inference,
             weight_decay=cfg.weight_decay,
         )
         self.optimizer_m = torch.optim.AdamW(
-            self.model.degradation.parameters(), lr=cfg.lr_degradation, weight_decay=cfg.weight_decay
+            raw_model.degradation.parameters(), lr=cfg.lr_degradation, weight_decay=cfg.weight_decay
         )
+        self.scheduler_i = torch.optim.lr_scheduler.LambdaLR(self.optimizer_i, lambda _: 1.0)
+        self.scheduler_m = torch.optim.lr_scheduler.LambdaLR(self.optimizer_m, lambda _: 1.0)
         if cfg.resume:
             self._load_resume(cfg.resume)
+        if cfg.distributed:
+            self.model = DistributedDataParallel(
+                raw_model, device_ids=[cfg.local_rank], output_device=cfg.local_rank,
+                find_unused_parameters=True, broadcast_buffers=False,
+            )
 
         first_batch = next(iter(self.train_loader))
         self.fixed_sample = batch_to_images(first_batch, self.device).detach()
-        self.save_checkpoint("epoch000000" if self.cfg.loop_mode == "epoch" else "step000000", step=0, epoch=0)
+        if not cfg.resume:
+            self.save_checkpoint("epoch000000" if self.cfg.loop_mode == "epoch" else "step000000", step=0, epoch=0)
+
+    @property
+    def is_rank0(self) -> bool:
+        return not self.cfg.distributed or self.cfg.rank == 0
+
+    @property
+    def raw_model(self) -> DGNet:
+        return self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
+
+    def _barrier(self) -> None:
+        if self.cfg.distributed and dist.is_initialized():
+            dist.barrier()
 
     def _make_logger(self) -> logging.Logger:
         logger = logging.getLogger(f"dg_train.{id(self)}")
         logger.setLevel(logging.INFO)
         logger.handlers.clear()
         formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-        file_handler = logging.FileHandler(self.output_dir / "run.log", encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-        logger.addHandler(stream_handler)
+        if self.is_rank0:
+            file_handler = logging.FileHandler(self.output_dir / "run.log", encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            logger.addHandler(stream_handler)
+        else:
+            logger.addHandler(logging.NullHandler())
         return logger
 
     def _check_model_config(self) -> None:
         expected = self.cfg.build_model_config()
-        if self.model.cfg.IMG_SIZE != expected.IMG_SIZE or self.model.cfg.PATCH_SIZE != expected.PATCH_SIZE:
+        if self.raw_model.cfg.IMG_SIZE != expected.IMG_SIZE or self.raw_model.cfg.PATCH_SIZE != expected.PATCH_SIZE:
             raise ValueError(
                 "checkpoint model config mismatch: "
-                f"checkpoint IMG/PATCH={(self.model.cfg.IMG_SIZE, self.model.cfg.PATCH_SIZE)} "
+                f"checkpoint IMG/PATCH={(self.raw_model.cfg.IMG_SIZE, self.raw_model.cfg.PATCH_SIZE)} "
                 f"requested={(expected.IMG_SIZE, expected.PATCH_SIZE)}"
             )
 
@@ -108,16 +144,16 @@ class DGTrainer:
             parameter.requires_grad_(enabled)
 
     def _phase_i(self) -> None:
-        self._set_requires_grad(self.model.degradation, False)
-        self._set_requires_grad(self.model.encoder, True)
-        self._set_requires_grad(self.model.decoder, True)
-        self._set_requires_grad(self.model.projection, True)
+        self._set_requires_grad(self.raw_model.degradation, False)
+        self._set_requires_grad(self.raw_model.encoder, True)
+        self._set_requires_grad(self.raw_model.decoder, True)
+        self._set_requires_grad(self.raw_model.projection, True)
 
     def _phase_m(self) -> None:
-        self._set_requires_grad(self.model.degradation, True)
-        self._set_requires_grad(self.model.encoder, False)
-        self._set_requires_grad(self.model.decoder, False)
-        self._set_requires_grad(self.model.projection, False)
+        self._set_requires_grad(self.raw_model.degradation, True)
+        self._set_requires_grad(self.raw_model.encoder, False)
+        self._set_requires_grad(self.raw_model.decoder, False)
+        self._set_requires_grad(self.raw_model.projection, False)
 
     def train_step(self, batch: Any) -> dict[str, float]:
         images = batch_to_images(batch, self.device)
@@ -128,18 +164,20 @@ class DGTrainer:
         values_i = self.loss_fn(self.model(images), step=self.global_step)
         values_i.inference_loss.backward()
         self.optimizer_i.step()
+        self.scheduler_i.step()
 
         self._phase_m()
         self.optimizer_m.zero_grad(set_to_none=True)
         values_m = self.loss_fn(self.model(images), step=self.global_step)
         values_m.degradation_loss.backward()
         self.optimizer_m.step()
+        self.scheduler_m.step()
 
         # Leave model fully trainable for checkpoints/eval state restoration.
-        self._set_requires_grad(self.model.degradation, True)
-        self._set_requires_grad(self.model.encoder, True)
-        self._set_requires_grad(self.model.decoder, True)
-        self._set_requires_grad(self.model.projection, True)
+        self._set_requires_grad(self.raw_model.degradation, True)
+        self._set_requires_grad(self.raw_model.encoder, True)
+        self._set_requires_grad(self.raw_model.decoder, True)
+        self._set_requires_grad(self.raw_model.projection, True)
 
         metrics = values_m.metrics()
         metrics.update(
@@ -147,14 +185,13 @@ class DGTrainer:
                 "train_loss": float(values_i.inference_loss.detach().item() + values_m.degradation_loss.detach().item()),
                 "inference_loss": float(values_i.inference_loss.detach().item()),
                 "degradation_loss": float(values_m.degradation_loss.detach().item()),
-                "mask_budget_distance": metrics.get("budget_distance", math.nan),
             }
         )
         return metrics
 
     def validate(self) -> dict[str, float]:
         metrics = evaluate_dgnet(
-            self.model,
+            self.raw_model,
             self.loss_fn,
             self.val_loader,
             self.device,
@@ -181,7 +218,8 @@ class DGTrainer:
         }
 
     def _record(self, row: dict[str, Any]) -> None:
-        append_metrics_csv(self.csv_path, row, DG_COLUMNS)
+        if self.is_rank0:
+            append_metrics_csv(self.csv_path, row, DG_COLUMNS)
 
     def _make_tag(self, *, step: int | None = None, epoch: int | None = None) -> str:
         if self.cfg.loop_mode == "epoch" or epoch is not None:
@@ -190,8 +228,11 @@ class DGTrainer:
 
     def save_checkpoint(self, tag: str, *, step: int | None = None, epoch: int | None = None) -> Path:
         tag_dir = self.output_dir / tag
+        if not self.is_rank0:
+            self._barrier()
+            return tag_dir
         tag_dir.mkdir(parents=True, exist_ok=True)
-        self.model.save(tag_dir)
+        self.raw_model.save(tag_dir)
         self.cfg.write_json(tag_dir / "train_config.json")
         # Keep config.json present after model.save; train_config is separate to avoid breaking DGNet.load.
         torch.save(
@@ -201,12 +242,14 @@ class DGTrainer:
                 "train_config": self.cfg.to_dict(),
                 "optimizer_i": self.optimizer_i.state_dict(),
                 "optimizer_m": self.optimizer_m.state_dict(),
+                "scheduler_i": self.scheduler_i.state_dict(),
+                "scheduler_m": self.scheduler_m.state_dict(),
                 "best_validation_score": self.best_validation_score,
             },
             tag_dir / "checkpoint.pt",
         )
         save_eval_artifacts(
-            self.model,
+            self.raw_model,
             self.loss_fn,
             self.fixed_sample,
             tag_dir,
@@ -215,6 +258,7 @@ class DGTrainer:
             write_model_log=True,
         )
         self.logger.info("checkpoint saved: %s", tag_dir)
+        self._barrier()
         return tag_dir
 
     def _load_resume(self, resume: str) -> None:
@@ -223,9 +267,14 @@ class DGTrainer:
         payload = torch.load(checkpoint_path, map_location=self.device)
         model_dir = checkpoint_path.parent
         if (model_dir / "model.pt").exists() and (model_dir / "config.json").exists():
-            self.model = DGNet.load(model_dir, map_location=self.device, verbose=False).to(self.device)
+            loaded = DGNet.load(model_dir, map_location=self.device, verbose=False).to(self.device)
+            self.raw_model.load_state_dict(loaded.state_dict())
         self.optimizer_i.load_state_dict(payload["optimizer_i"])
         self.optimizer_m.load_state_dict(payload["optimizer_m"])
+        if "scheduler_i" in payload:
+            self.scheduler_i.load_state_dict(payload["scheduler_i"])
+        if "scheduler_m" in payload:
+            self.scheduler_m.load_state_dict(payload["scheduler_m"])
         self.global_step = int(payload.get("global_step", 0))
         self.epoch = int(payload.get("epoch", 0))
         self.best_validation_score = float(payload.get("best_validation_score", -math.inf))
@@ -243,12 +292,6 @@ class DGTrainer:
         if train_metrics:
             row.update({k: v for k, v in train_metrics.items() if k in DG_COLUMNS})
         row.update(metrics)
-        # CSV column aliases expected by agent.md.
-        row["mask_budget_distance"] = row.get("mask_budget_distance", row.get("budget_distance", math.nan))
-        row["alpha_inference"] = row.get("alpha_inference", math.nan)
-        row["alpha_target"] = row.get("alpha_target", math.nan)
-        row["lambda_budget"] = row.get("lambda_budget", math.nan)
-        row["lambda_reg"] = row.get("lambda_reg", math.nan)
         self._record(row)
         self.logger.info(
             "validation step=%d epoch=%d loss=%.6f score=%.6f",
@@ -257,8 +300,9 @@ class DGTrainer:
             row.get("validation_loss", math.nan),
             row.get("validation_score", math.nan),
         )
-        plot_loss_curve(self.csv_path, self.output_dir / "loss_curve.png")
-        plot_accuracy_curve(self.csv_path, self.output_dir / "accuracy.png")
+        if self.is_rank0:
+            plot_loss_curve(self.csv_path, self.output_dir / "loss_curve.png")
+            plot_accuracy_curve(self.csv_path, self.output_dir / "accuracy.png")
         return metrics
 
     def run(self) -> None:
@@ -267,12 +311,17 @@ class DGTrainer:
                 self._run_step_mode()
             else:
                 self._run_epoch_mode()
-            plot_loss_curve(self.csv_path, self.output_dir / "loss_curve.png")
-            plot_accuracy_curve(self.csv_path, self.output_dir / "accuracy.png")
+            if self.is_rank0:
+                plot_loss_curve(self.csv_path, self.output_dir / "loss_curve.png")
+                plot_accuracy_curve(self.csv_path, self.output_dir / "accuracy.png")
             self.logger.info("DGNet pretraining completed: output_dir=%s", self.output_dir)
         except Exception:
             self.logger.error("training failed at step=%d epoch=%d\n%s", self.global_step, self.epoch, traceback.format_exc())
             raise
+        finally:
+            self._barrier()
+            if self.cfg.distributed and dist.is_initialized():
+                dist.destroy_process_group()
 
     def _run_step_mode(self) -> None:
         iterator = iter(self.train_loader)
@@ -286,8 +335,7 @@ class DGTrainer:
             self.global_step += 1
             metrics = self.train_step(batch)
             row = self._base_row(phase="I/M", split="train")
-            row.update({k: v for k, v in metrics.items() if k in set(DG_COLUMNS) | {"budget_distance"}})
-            row["mask_budget_distance"] = row.get("mask_budget_distance", row.get("budget_distance", math.nan))
+            row.update({k: v for k, v in metrics.items() if k in DG_COLUMNS})
             self._record(row)
             if self._should_validate_step():
                 self._after_validation(metrics, phase="validation")
@@ -310,8 +358,7 @@ class DGTrainer:
                 self.global_step += 1
                 last_metrics = self.train_step(batch)
                 row = self._base_row(phase="I/M", split="train")
-                row.update({k: v for k, v in last_metrics.items() if k in set(DG_COLUMNS) | {"budget_distance"}})
-                row["mask_budget_distance"] = row.get("mask_budget_distance", row.get("budget_distance", math.nan))
+                row.update({k: v for k, v in last_metrics.items() if k in DG_COLUMNS})
                 self._record(row)
             if self.cfg.validate_every_epochs > 0 and epoch % self.cfg.validate_every_epochs == 0:
                 self._after_validation(last_metrics, phase="validation")
