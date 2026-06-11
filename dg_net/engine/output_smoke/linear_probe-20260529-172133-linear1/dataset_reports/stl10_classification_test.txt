@@ -1,8 +1,8 @@
 dataset: STL10
 training_type: classification
 split: test
-data_path: /home/cv202355545/dataset
-resolved_data_path: /home/cv202355545/dataset/stl10/val
+data_path: /home/jeongyuseong/바탕화면/datasets
+resolved_data_path: /home/jeongyuseong/바탕화면/datasets/stl10/val
 samples: 4
 batch_size: 2
 sampler: SequentialSampler

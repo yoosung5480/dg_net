@@ -8,6 +8,7 @@ from typing import Literal
 
 
 ScheduleKind = Literal["none", "linear", "cosine"]
+RepresentationDistanceKind = Literal["cosine", "infonce"]
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class TermWeightConfig:
         return self.weight * factor
 
 
+
 def _term(weight: float = 0.0) -> TermWeightConfig:
     return TermWeightConfig(weight=weight)
 
@@ -60,7 +62,9 @@ class LossConfig:
     dg_sparse: TermWeightConfig = field(default_factory=lambda: _term(0.0))
     tau_deg: float = 0.05
     tau_budget: float = 0.01
-    representation_distance: Literal["cosine"] = "cosine"
+    tau_rep: float = 0.5
+    representation_distance: RepresentationDistanceKind = "cosine"
+    infonce_temperature: float = 0.2
     eps: float = 1.0e-8
     inference_reduction: Literal["mean", "sum"] = "mean"
     dg_reduction: Literal["mean", "sum"] = "mean"
@@ -68,10 +72,14 @@ class LossConfig:
     def __post_init__(self) -> None:
         if self.tau_deg < 0.0 or self.tau_budget < 0.0:
             raise ValueError("tau_deg and tau_budget must be non-negative.")
+        if not 0.0 < self.tau_rep <= 2.0:
+            raise ValueError("tau_rep must be in the cosine-distance range (0, 2].")
         if self.eps <= 0.0:
             raise ValueError("eps must be positive.")
-        if self.representation_distance != "cosine":
-            raise ValueError("Only cosine representation distance is supported.")
+        if self.representation_distance not in ("cosine", "infonce"):
+            raise ValueError("representation_distance must be 'cosine' or 'infonce'.")
+        if self.infonce_temperature <= 0.0:
+            raise ValueError("infonce_temperature must be positive.")
         if self.inference_reduction not in ("mean", "sum") or self.dg_reduction not in ("mean", "sum"):
             raise ValueError("reductions must be 'mean' or 'sum'.")
 
@@ -109,8 +117,11 @@ class LossConfig:
         }
 
 
+
 def effective_weight(config: TermWeightConfig, step: int = 0) -> float:
     return config.effective_weight(step)
 
 
-__all__ = ["LossConfig", "ScheduleKind", "TermWeightConfig", "effective_weight"]
+__all__ = [
+    "LossConfig", "RepresentationDistanceKind", "ScheduleKind", "TermWeightConfig", "effective_weight",
+]

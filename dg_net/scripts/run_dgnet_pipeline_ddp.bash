@@ -10,24 +10,28 @@ SRC_ROOT="${SRC_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "${SRC_ROOT}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-DATA_PATH="${DATA_PATH:-/home/cv202355545/dataset}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-output/dgnet_hybrid_ddp}"
+DATA_PATH="${DATA_PATH:-/home/jeongyuseong/바탕화면/datasets}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-output/ddp_test}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 EVAL_MAX_BATCHES="${EVAL_MAX_BATCHES:-20}"
 DATASET="${DATASET:-STL10}"
 IMG_SIZE="${IMG_SIZE:-96}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-512}"
+BATCH_SIZE="${BATCH_SIZE:-1024}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2048}"
 PATCH_SIZE="${PATCH_SIZE:-16}"
 EMBED_DIM="${EMBED_DIM:-192}"
 DEPTH="${DEPTH:-4}"
 NUM_HEADS="${NUM_HEADS:-3}"
 PROJECTION_DIM="${PROJECTION_DIM:-192}"
+REPRESENTATION_DISTANCE="${REPRESENTATION_DISTANCE:-cosine}"
+INFONCE_TEMPERATURE="${INFONCE_TEMPERATURE:-0.2}"
+DG_SPATIAL_REFINEMENT="${DG_SPATIAL_REFINEMENT:-false}"
+DG_REFINEMENT_CHANNELS="${DG_REFINEMENT_CHANNELS:-32}"
 
-PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-100}"
-LINEAR_EPOCHS="${LINEAR_EPOCHS:-20}"
-SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-10}"
+PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-1}"
+LINEAR_EPOCHS="${LINEAR_EPOCHS:-1}"
+SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
 
 PRETRAIN_RUN_ID="${PRETRAIN_RUN_ID:-ddp-hybrid-pretrain-${STAMP}}"
 LINEAR_RUN_ID="${LINEAR_RUN_ID:-ddp-hybrid-linear-probe-${STAMP}}"
@@ -76,33 +80,42 @@ COMMON_MODEL_ARGS=(
   --drop-path 0.1
 )
 
+REFINEMENT_ARGS=(--no-dg-spatial-refinement)
+if [[ "${DG_SPATIAL_REFINEMENT}" == "true" ]]; then
+  REFINEMENT_ARGS=(--dg-spatial-refinement)
+fi
+REFINEMENT_ARGS+=(--dg-refinement-channels "${DG_REFINEMENT_CHANNELS}")
+
 LOSS_ARGS=(
   --loss-mode hybrid
+  --representation-distance "${REPRESENTATION_DISTANCE}"
+  --infonce-temperature "${INFONCE_TEMPERATURE}"
   --inference-rec-weight 1.0
   --inference-rec-schedule none
-  --inference-rep-weight 1.0
-  --inference-rep-schedule cosine
-  --inference-rep-start 0.0
-  --inference-rep-end 1.0
-  --inference-rep-total-steps 10000
+  --inference-rep-weight 0.5
+  --inference-rep-schedule none
   --dg-target-weight 0.1
-  --dg-target-schedule none
-  --dg-budget-weight 1.0
-  --dg-budget-schedule linear
-  --dg-budget-start 0.0
-  --dg-budget-end 1.0
-  --dg-budget-total-steps 5000
-  --dg-kl-weight 0.01
-  --dg-kl-schedule cosine
-  --dg-kl-start 0.0
-  --dg-kl-end 1.0
-  --dg-kl-total-steps 10000
-  --dg-rep-weight 1.0
-  --dg-rep-schedule none
+  --dg-target-schedule cosine
+  --dg-target-start 0.001
+  --dg-target-end 0.1
+  --dg-target-total-steps 10000
+  --dg-budget-weight 0.05
+  --dg-budget-schedule cosine
+  --dg-budget-start 0.01
+  --dg-budget-end 0.05
+  --dg-budget-total-steps 10000
+  --dg-kl-weight 0.0
+  --dg-kl-schedule none
+  --dg-rep-target-weight 0.05
+  --dg-rep-schedule cosine
+  --dg-rep-start 0.001
+  --dg-rep-end 0.05
+  --dg-rep-total-steps 10000
   --dg-sparse-weight 0.0
   --dg-sparse-schedule none
   --tau-deg 0.5
-  --tau-budget 0.01
+  --tau-budget 0.3
+  --tau-rep 0.5
   --loss-reduction mean
 )
 
@@ -118,6 +131,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" engine/dg_train.py \
   --seed 42 \
   "${COMMON_DATA_ARGS[@]}" \
   "${COMMON_MODEL_ARGS[@]}" \
+  "${REFINEMENT_ARGS[@]}" \
   "${LOSS_ARGS[@]}" \
   --lr-inference 1.5e-4 \
   --lr-degradation 1.0e-4 \
@@ -140,13 +154,14 @@ CUDA_VISIBLE_DEVICES="${LINEAR_CUDA_DEVICE:-0}" python engine/linear_probe_train
   --loop-mode epoch \
   --total-epochs "${LINEAR_EPOCHS}" \
   --validate-every-epochs 1 \
-  --save-every-epochs 10 \
+  --save-every-epochs ${SAVE_EVERY_EPOCHS} \
   --output-root "${OUTPUT_ROOT}" \
   --run-id "${LINEAR_RUN_ID}" \
   --run-name ddp-hybrid-linear-probe \
   --seed 42 \
   "${LINEAR_DATA_ARGS[@]}" \
   "${COMMON_MODEL_ARGS[@]}" \
+  "${REFINEMENT_ARGS[@]}" \
   --classifier-lr 1.0e-3 \
   --weight-decay 0.0
 

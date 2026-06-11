@@ -14,10 +14,10 @@ this module creates construction, save/load, and sample-inference artifacts in
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields as dataclass_fields, replace
 import json
 from pathlib import Path
-from typing import NamedTuple, Tuple
+from typing import Any, NamedTuple, Tuple
 
 from PIL import Image, ImageDraw
 import torch
@@ -74,6 +74,15 @@ class DgNetConfig:
     CNN_DROPOUT: float = 0.0
     FFN_DROPOUT: float = 0.0
 
+    DG_SPATIAL_REFINEMENT: bool = False
+    DG_REFINEMENT_CHANNELS: int = 32
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "DgNetConfig":
+        known = {field.name for field in dataclass_fields(cls)}
+        filtered = {key: value for key, value in values.items() if key in known}
+        return cls(**filtered)
+
     def encoder_dim(self) -> int:
         return self.ENCODER_EMBED_DIM or self.EMBED_DIM
 
@@ -104,8 +113,8 @@ class DgNetConfig:
     def validate(self) -> None:
         if self.IMG_SIZE <= 0 or self.PATCH_SIZE <= 0 or self.IMG_SIZE % self.PATCH_SIZE:
             raise ValueError("IMG_SIZE must be positive and divisible by PATCH_SIZE.")
-        if self.IN_CHANS <= 0 or self.PROJECTION_DIM <= 0:
-            raise ValueError("IN_CHANS and PROJECTION_DIM must be positive.")
+        if self.IN_CHANS <= 0 or self.PROJECTION_DIM <= 0 or self.DG_REFINEMENT_CHANNELS <= 0:
+            raise ValueError("IN_CHANS, PROJECTION_DIM, and DG_REFINEMENT_CHANNELS must be positive.")
         if self.ENCODER_ARCHITECT.upper() != "VIT" or self.DECODER_ARCHITECT.upper() != "VIT":
             raise ValueError("DGNet keeps ENCODER_ARCHITECT and DECODER_ARCHITECT fixed to VIT.")
         if self.DG_ARCHITECT.upper() not in {"VIT", "CNN", "HYBRID"}:
@@ -281,6 +290,26 @@ class ViTDecoder(nn.Module):
         return unpatchify(predicted_patches, self.patch_size, self.in_chans, self.grid_size)
 
 
+class SpatialRefinementHead(nn.Module):
+    """Default-off full-image residual refinement applied after unpatchify."""
+
+    def __init__(self, in_chans: int, refinement_channels: int) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_chans, refinement_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(refinement_channels, refinement_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(refinement_channels, in_chans, kernel_size=3, padding=1),
+        )
+        final_conv = self.layers[-1]
+        nn.init.zeros_(final_conv.weight)
+        nn.init.zeros_(final_conv.bias)
+
+    def forward(self, residual: torch.Tensor) -> torch.Tensor:
+        return self.layers(residual)
+
+
 class DegradationGenerator(nn.Module):
     """Selectable residual generator ``M`` with a zero-initialized output head."""
 
@@ -298,6 +327,11 @@ class DegradationGenerator(nn.Module):
         self.residual_head = nn.Linear(dim, cfg.PATCH_SIZE * cfg.PATCH_SIZE * cfg.IN_CHANS)
         nn.init.zeros_(self.residual_head.weight)
         nn.init.zeros_(self.residual_head.bias)
+        self.spatial_refinement = (
+            SpatialRefinementHead(cfg.IN_CHANS, cfg.DG_REFINEMENT_CHANNELS)
+            if cfg.DG_SPATIAL_REFINEMENT
+            else None
+        )
 
     @property
     def grid_size(self) -> Tuple[int, int]:
@@ -309,7 +343,10 @@ class DegradationGenerator(nn.Module):
             tokens = tokens + self.pos_embed
         tokens = self.blocks(tokens, self.grid_size)
         residual_patches = self.residual_head(self.norm(tokens))
-        return unpatchify(residual_patches, self.patch_size, self.in_chans, self.grid_size)
+        patch_residual = unpatchify(residual_patches, self.patch_size, self.in_chans, self.grid_size)
+        if self.spatial_refinement is None:
+            return patch_residual
+        return patch_residual + self.spatial_refinement(patch_residual)
 
 
 class DgNetOutput(NamedTuple):
@@ -390,7 +427,7 @@ class DGNet(nn.Module):
         """Construct from saved config and load weights."""
 
         directory = Path(save_path)
-        config = DgNetConfig(**json.loads((directory / "config.json").read_text(encoding="utf-8")))
+        config = DgNetConfig.from_dict(json.loads((directory / "config.json").read_text(encoding="utf-8")))
         model = cls(config)
         state = torch.load(directory / "model.pt", map_location=map_location, weights_only=True)
         model.load_state_dict(state)
@@ -450,27 +487,182 @@ def _tensor_to_pil(image: torch.Tensor) -> Image.Image:
     return Image.fromarray(array)
 
 
-def save_sample_visualization(output: DgNetOutput, output_path: str | Path) -> Path:
-    """Write one input/degraded/reconstructed sample comparison image."""
+def _ensure_bchw(image: torch.Tensor) -> torch.Tensor:
+    if image.ndim == 3:
+        return image.unsqueeze(0)
+    if image.ndim != 4:
+        raise ValueError(f"Expected [C,H,W] or [B,C,H,W], got {tuple(image.shape)}.")
+    return image
 
-    panels = [
-        ("original input", output.original[0]),
-        ("degraded x - M(x)", output.degraded[0]),
-        ("decoder reconstruction", output.reconstruction[0]),
+
+def compute_patch_seam_ratio(image: torch.Tensor, patch_size: int) -> float:
+    batch = _ensure_bchw(image).detach()
+    _, _, height, width = batch.shape
+    if patch_size <= 0 or height < 2 or width < 2:
+        raise ValueError("patch_size must be positive and spatial dimensions must exceed 1.")
+
+    horizontal = (batch[:, :, :, 1:] - batch[:, :, :, :-1]).abs().mean(dim=1)
+    vertical = (batch[:, :, 1:, :] - batch[:, :, :-1, :]).abs().mean(dim=1)
+
+    h_positions = torch.arange(1, width, device=batch.device)
+    v_positions = torch.arange(1, height, device=batch.device)
+    h_boundary = (h_positions % patch_size) == 0
+    v_boundary = (v_positions % patch_size) == 0
+
+    boundary_values = []
+    interior_values = []
+    if h_boundary.any():
+        boundary_values.append(horizontal[:, :, h_boundary])
+    if v_boundary.any():
+        boundary_values.append(vertical[:, v_boundary, :])
+    if (~h_boundary).any():
+        interior_values.append(horizontal[:, :, ~h_boundary])
+    if (~v_boundary).any():
+        interior_values.append(vertical[:, ~v_boundary, :])
+
+    if not boundary_values or not interior_values:
+        return 0.0
+
+    boundary_jump = torch.cat([value.reshape(-1) for value in boundary_values]).mean()
+    interior_jump = torch.cat([value.reshape(-1) for value in interior_values]).mean()
+    return float((boundary_jump / (interior_jump + 1e-8)).item())
+
+
+def compute_cross_patch_influence(
+    degradation: nn.Module,
+    image: torch.Tensor,
+    patch_size: int,
+    perturbation: float = 0.1,
+) -> float:
+    batch = _ensure_bchw(image)
+    if batch.shape[0] != 1:
+        raise ValueError("Cross-patch influence expects a batch size of 1.")
+    _, _, height, width = batch.shape
+    patch_rows, patch_cols = height // patch_size, width // patch_size
+    patch_row, patch_col = patch_rows // 2, patch_cols // 2
+    row_slice = slice(patch_row * patch_size, (patch_row + 1) * patch_size)
+    col_slice = slice(patch_col * patch_size, (patch_col + 1) * patch_size)
+
+    perturbed = batch.clone()
+    perturbed[:, :, row_slice, col_slice] = (
+        perturbed[:, :, row_slice, col_slice] + perturbation
+    ).clamp(0.0, 1.0)
+
+    with torch.no_grad():
+        baseline = degradation(batch)
+        shifted = degradation(perturbed)
+
+    delta = (shifted - baseline).abs()
+    source_mask = torch.zeros((1, 1, height, width), dtype=torch.bool, device=delta.device)
+    source_mask[:, :, row_slice, col_slice] = True
+    source = delta.masked_select(source_mask.expand_as(delta)).mean()
+    outside = delta.masked_select((~source_mask).expand_as(delta)).mean()
+    return float((outside / (source + 1e-8)).item())
+
+
+def _render_residual_heatmap(image: torch.Tensor) -> Image.Image:
+    magnitude = image.detach().abs().mean(dim=0)
+    normalized = magnitude / (magnitude.max() + 1e-8)
+    red = normalized
+    green = (1.0 - (normalized - 0.5).abs() * 2.0).clamp(0.0, 1.0)
+    blue = (1.0 - normalized).clamp(0.0, 1.0)
+    rgb = torch.stack([red, green, blue], dim=0)
+    return _tensor_to_pil(rgb)
+
+
+def _representation_cosine_metrics(output: DgNetOutput) -> tuple[float, float]:
+    similarity = torch.nn.functional.cosine_similarity(
+        output.representation[0], output.degraded_representation[0], dim=0
+    ).item()
+    return float(similarity), float(1.0 - similarity)
+
+
+def _infer_patch_size(residual: torch.Tensor) -> int:
+    height, width = residual.shape[-2:]
+    if height != width:
+        raise ValueError("Visualization assumes square images for patch-size inference.")
+    candidates = [candidate for candidate in (16, 14, 8, 4, 2) if candidate < height and height % candidate == 0]
+    if not candidates:
+        return max(1, height // 2)
+    scored = [(compute_patch_seam_ratio(residual, patch_size=candidate), candidate) for candidate in candidates]
+    return max(scored)[1]
+
+
+def _visualization_metrics(output: DgNetOutput) -> dict[str, float]:
+    residual = output.residual[0]
+    reconstruction_error = (output.original[0] - output.reconstruction[0]).pow(2).mean().item()
+    degraded_reconstruction_error = (output.degraded[0] - output.reconstruction[0]).pow(2).mean().item()
+    cosine_similarity, cosine_distance = _representation_cosine_metrics(output)
+    patch_size = _infer_patch_size(residual)
+    return {
+        "residual_mean": residual.abs().mean().item(),
+        "residual_std": residual.abs().std().item(),
+        "residual_max": residual.abs().max().item(),
+        "reconstruction_mse": float(reconstruction_error),
+        "degraded_reconstruction_mse": float(degraded_reconstruction_error),
+        "cosine_similarity": cosine_similarity,
+        "cosine_distance": cosine_distance,
+        "patch_seam_ratio": compute_patch_seam_ratio(residual, patch_size=patch_size),
+    }
+
+
+def save_sample_visualization(output: DgNetOutput, output_path: str | Path) -> Path:
+    """Write a seven-panel DGNet diagnostic image plus a metrics sidecar."""
+
+    original = output.original[0]
+    degraded = output.degraded[0]
+    reconstruction = output.reconstruction[0]
+    absolute_residual = (original - degraded).abs()
+    normalized_heatmap = _render_residual_heatmap(output.residual[0])
+    reconstruction_error = (original - reconstruction).abs()
+    degraded_reconstruction_error = (degraded - reconstruction).abs()
+    metrics = _visualization_metrics(output)
+
+    panels: list[tuple[str, Image.Image]] = [
+        ("original", _tensor_to_pil(original)),
+        ("degraded", _tensor_to_pil(degraded)),
+        ("reconstruction", _tensor_to_pil(reconstruction)),
+        ("absolute residual |x-x_dg|", _tensor_to_pil(absolute_residual)),
+        ("normalized residual heatmap", normalized_heatmap),
+        ("reconstruction error |x-recon|", _tensor_to_pil(reconstruction_error)),
+        ("degraded recon error |x_dg-recon|", _tensor_to_pil(degraded_reconstruction_error)),
     ]
+    panel_width, panel_height = 224, 224
+    title_height, footer_height = 28, 84
     rendered: list[Image.Image] = []
-    for title, tensor in panels:
-        image = _tensor_to_pil(tensor).resize((224, 224))
-        panel = Image.new("RGB", (224, 250), "white")
-        panel.paste(image, (0, 26))
-        ImageDraw.Draw(panel).text((6, 6), title, fill="black")
-        rendered.append(panel)
-    comparison = Image.new("RGB", (len(rendered) * 224, 250), "white")
+    for title, image in panels:
+        canvas = Image.new("RGB", (panel_width, title_height + panel_height), "white")
+        canvas.paste(image.resize((panel_width, panel_height)), (0, title_height))
+        ImageDraw.Draw(canvas).text((6, 8), title, fill="black")
+        rendered.append(canvas)
+
+    footer_lines = [
+        f"residual mean/std/max: {metrics['residual_mean']:.6f} / {metrics['residual_std']:.6f} / {metrics['residual_max']:.6f}",
+        f"reconstruction mse: {metrics['reconstruction_mse']:.6f} | degraded reconstruction mse: {metrics['degraded_reconstruction_mse']:.6f}",
+        f"cosine similarity/distance: {metrics['cosine_similarity']:.6f} / {metrics['cosine_distance']:.6f} | patch seam ratio: {metrics['patch_seam_ratio']:.6f}",
+    ]
+
+    comparison = Image.new(
+        "RGB",
+        (len(rendered) * panel_width, title_height + panel_height + footer_height),
+        "white",
+    )
     for index, panel in enumerate(rendered):
-        comparison.paste(panel, (index * 224, 0))
+        comparison.paste(panel, (index * panel_width, 0))
+    drawer = ImageDraw.Draw(comparison)
+    footer_y = title_height + panel_height + 8
+    for line in footer_lines:
+        drawer.text((6, footer_y), line, fill="black")
+        footer_y += 24
+
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     comparison.save(path)
+    metrics_path = path.with_name(f"{path.stem}_metrics.txt")
+    metrics_path.write_text(
+        "\n".join(f"{key}: {value:.8f}" for key, value in metrics.items()) + "\n",
+        encoding="utf-8",
+    )
     return path
 
 
@@ -498,6 +690,7 @@ def write_model_report(
         f"representation_shape: {tuple(output.representation.shape)}",
         f"initial_residual_max_abs: {output.residual.abs().max().item():.8f}",
         f"initial_degraded_equals_input: {torch.equal(output.degraded, sample_batch)}",
+        f"sample_patch_seam_ratio: {compute_patch_seam_ratio(output.residual, model.cfg.PATCH_SIZE):.8f}",
     ]
     report_path.write_text("\n".join(report) + "\n", encoding="utf-8")
     save_sample_visualization(output, directory / "dg_model_sample.png")

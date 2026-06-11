@@ -413,9 +413,9 @@ D_{\text{budget}}^{DG}
 -
 \lambda_{\text{KL}}^{DG}
 D_{\text{KL}}^{DG}
--
-\alpha_{\text{rep}}^{DG}
-D_{\text{rep}}^{DG}
++
+\alpha_{\text{target-rep}}^{DG}
+D_{\text{target-rep}}^{DG}
 +
 \lambda_{\text{sparse}}^{DG}
 D_{\text{sparse}}^{DG}
@@ -428,18 +428,18 @@ $$
 \mathcal{L}_{DG}
 $$
 
-여기서 representation term 앞에 음수가 붙는 이유는 DGNet이 representation distance를 키워야 하기 때문이다.
+여기서 representation term은 더 이상 단순히 representation distance를 무한히 키우는 항이 아니다.
+
+DGNet은 원본 image와 degraded image 사이의 representation distance를 목표 semantic gap인 $\tau_{\text{rep}}$ 근처로 맞춘다.
 
 $$
 \min_{DGNet}
-\left(
--
-\alpha_{\text{rep}}^{DG}
-D_{\text{rep}}^{DG}
-\right)
-\equiv
-\max_{DGNet}
-D_{\text{rep}}^{DG}
+\alpha_{\text{target-rep}}^{DG}
+D_{\text{target-rep}}^{DG}
+\quad\Rightarrow\quad
+D_{\text{rep}}^{DG,(b)}
+\rightarrow
+\tau_{\text{rep}}
 $$
 
 ---
@@ -628,22 +628,12 @@ $$
 
 ---
 
-### 8.4 DGNet representation loss
+### 8.4 DGNet targeted representation distance
 
 Representation distance는 원본 image와 degraded image의 representation 사이에서 계산한다.
 
 $$
-D_{\text{rep}}^{DG}
-=
-\frac{1}{B}
-\sum_{b=1}^{B}
-D_{\text{rep}}^{(b)}
-$$
-
-cosine distance를 사용하면 다음과 같다.
-
-$$
-D_{\text{rep}}^{(b)}
+D_{\text{rep}}^{DG,(b)}
 =
 1
 -
@@ -654,29 +644,91 @@ D_{\text{rep}}^{(b)}
 }
 $$
 
-DGNet은 이 값을 키우는 방향으로 학습된다.
+기존의 adversarial representation objective는 DGNet이 이 값을 계속 키우는 방향이었다.
 
 $$
-D_{\text{rep}}^{DG} \uparrow
-$$
-
-하지만 전체 DGNet objective는 minimization 형태로 작성하기 때문에 loss에는 음수로 들어간다.
-
-$$
--
-\alpha_{\text{rep}}^{DG}
+\max_{DGNet}
 D_{\text{rep}}^{DG}
 $$
 
-이는 ADIOS 계열의 representation adversarial objective와 대응된다.
+하지만 본 실험의 현재 목적은 degraded image가 원본 image와 의미론적으로 완전히 멀어지는 것이 아니다.
+
+DGNet은 representation distance를 무한히 키우는 것이 아니라, semantic gap이 너무 작지도 크지도 않은 목표 거리로 수렴하도록 학습된다.
+
+목표 representation threshold를 다음과 같이 둔다.
 
 $$
-\min_I D_{\text{rep}}
+\tau_{\text{rep}} > 0
+$$
+
+이미지별 targeted representation distance는 다음과 같다.
+
+$$
+D_{\text{target-rep}}^{DG,(b)}
+=
+\left|
+D_{\text{rep}}^{DG,(b)}
+-
+\tau_{\text{rep}}
+\right|
+$$
+
+최종 batch 평균은 다음과 같다.
+
+$$
+D_{\text{target-rep}}^{DG}
+=
+\frac{1}{B}
+\sum_{b=1}^{B}
+D_{\text{target-rep}}^{DG,(b)}
+$$
+
+SmoothL1을 사용할 경우 다음과 같이 정의할 수 있다.
+
+$$
+D_{\text{target-rep}}^{DG}
+=
+\frac{1}{B}
+\sum_{b=1}^{B}
+\operatorname{SmoothL1}
+\left(
+D_{\text{rep}}^{DG,(b)}
+-
+\tau_{\text{rep}}
+\right)
+$$
+
+DGNet loss에는 이 항이 양수로 들어간다.
+
+$$
++
+\alpha_{\text{target-rep}}^{DG}
+D_{\text{target-rep}}^{DG}
+$$
+
+따라서 DGNet을 minimize하면 다음 방향으로 작동한다.
+
+$$
+D_{\text{rep}}^{DG,(b)}
+\rightarrow
+\tau_{\text{rep}}
+$$
+
+의미는 다음과 같다.
+
+$$
+D_{\text{rep}}^{DG,(b)} \ll \tau_{\text{rep}}
+\Rightarrow
+\text{degraded view가 너무 쉬우므로 representation gap을 키운다.}
 $$
 
 $$
-\max_{DGNet} D_{\text{rep}}
+D_{\text{rep}}^{DG,(b)} \gg \tau_{\text{rep}}
+\Rightarrow
+\text{degraded view가 의미론적으로 너무 멀어졌으므로 representation gap을 줄인다.}
 $$
+
+즉 이 항은 DGNet이 원본과 degraded image의 의미론적 차이를 일정 수준 안에서 유지하도록 만드는 semantic difficulty constraint이다.
 
 ---
 
@@ -746,15 +798,14 @@ DGNet objective는 다음과 같다.
 $$
 \mathcal{L}_{DG}
 =
--
-\alpha_{\text{rep}}^{DG}
-D_{\text{rep}}^{DG}
+\alpha_{\text{target-rep}}^{DG}
+D_{\text{target-rep}}^{DG}
 +
 \lambda_{\text{sparse}}^{DG}
 D_{\text{sparse}}^{DG}
 $$
 
-목적은 representation-level adversarial masking 또는 degradation이 SSL 성능에 미치는 영향을 확인하는 것이다.
+목적은 representation-level semantic gap을 목표 threshold 근처로 제어하는 degradation이 SSL 성능에 미치는 영향을 확인하는 것이다.
 
 ---
 
@@ -800,7 +851,7 @@ $$
 
 ### 9.3 Representation + Reconstruction hybrid
 
-이 설정은 representation-level adversarial signal과 reconstruction-level adversarial signal을 함께 사용한다.
+이 설정은 targeted representation-level semantic difficulty signal과 reconstruction-level adversarial signal을 함께 사용한다.
 
 Inference Network objective는 다음과 같다.
 
@@ -819,23 +870,16 @@ DGNet objective는 다음과 같다.
 $$
 \mathcal{L}_{DG}
 =
-\alpha_{\text{target}}^{DG}
-D_{\text{target}}^{DG}
-+
-\lambda_{\text{budget}}^{DG}
-D_{\text{budget}}^{DG}
--
-\lambda_{\text{KL}}^{DG}
-D_{\text{KL}}^{DG}
--
-\alpha_{\text{rep}}^{DG}
-D_{\text{rep}}^{DG}
+\mathcal{L}_{DG}
+=
+\alpha_{\text{target-rep}}^{DG}
+D_{\text{target-rep}}^{DG}
 +
 \lambda_{\text{sparse}}^{DG}
 D_{\text{sparse}}^{DG}
 $$
 
-목적은 representation 관점에서도 어렵고, pixel reconstruction 관점에서도 적절히 어려운 문제를 생성하는 hybrid problem generator가 더 좋은 SSL 성능을 내는지 확인하는 것이다.
+목적은 representation 관점에서는 목표 semantic gap을 유지하고, pixel reconstruction 관점에서는 적절히 어려운 문제를 생성하는 hybrid problem generator가 더 좋은 SSL 성능을 내는지 확인하는 것이다.
 
 ---
 

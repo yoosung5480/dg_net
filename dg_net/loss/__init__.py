@@ -1,10 +1,10 @@
 """Public tensor-only DGNet loss API with lazy module loading."""
 
-from .loss_config import LossConfig, ScheduleKind, TermWeightConfig, effective_weight
+from .loss_config import LossConfig, RepresentationDistanceKind, ScheduleKind, TermWeightConfig, effective_weight
 
 _LOSS_EXPORTS = {
     "ChannelWiseSpatialKL", "DGBudgetDistance", "DGLoss", "DGLossOutput",
-    "DGTargetDistance", "InferenceReconstructionLoss", "RepresentationDistance",
+    "DGTargetDistance", "DGTargetRepresentationDistance", "InferenceReconstructionLoss", "InfoNCELoss", "RepresentationDistance",
     "SparsePenalty", "prepare_dgloss", "write_loss_report",
 }
 
@@ -18,5 +18,5 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    *_LOSS_EXPORTS, "LossConfig", "ScheduleKind", "TermWeightConfig", "effective_weight",
+    *_LOSS_EXPORTS, "LossConfig", "RepresentationDistanceKind", "ScheduleKind", "TermWeightConfig", "effective_weight",
 ]

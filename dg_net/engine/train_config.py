@@ -33,7 +33,20 @@ from model.dg_model import DgNetConfig  # noqa: E402
 
 TASKS = ("dg_pretrain", "linear_probe", "knn_eval", "finetune", "eval")
 LOOP_MODES = ("step", "epoch")
-CLASS_COUNTS = {"STL10": 10, "CIFAR100": 100, "Flowers102": 102, "iNaturalist": 10000, "Synthetic": 10}
+CLASS_COUNTS = {
+    "stl10": 10,
+    "cifar100": 100,
+    "flowers102": 102,
+    "inaturalist": 10000,
+    "inat": 10000,
+    "imagenet": 1000,
+    "imagefolder": 1000,
+    "synthetic": 10,
+}
+
+
+def _default_num_classes(dataset: str) -> int:
+    return CLASS_COUNTS.get(dataset.strip().lower(), 10)
 
 
 def _parse_tuple(value: str | Iterable[float] | None, *, length: int = 3) -> tuple[float, ...] | None:
@@ -86,7 +99,7 @@ class TrainConfig:
 
     # Dataset
     dataset: str = "STL10"
-    data_path: str = "/home/cv202355545/dataset"
+    data_path: str = "/home/jeongyuseong/바탕화면/datasets"
     split: str = "train"
     val_split: Optional[str] = None
     download: bool = False
@@ -131,6 +144,8 @@ class TrainConfig:
     attn_dropout: float = 0.0
     proj_dropout: float = 0.0
     drop_path: float = 0.0
+    dg_spatial_refinement: bool = False
+    dg_refinement_channels: int = 32
 
     # Loss: None means keep the selected mode preset value.
     loss_mode: str = "reconstruction_only"
@@ -171,7 +186,9 @@ class TrainConfig:
     dg_sparse_total_steps: Optional[int] = None
     tau_deg: float = 0.05
     tau_budget: float = 0.01
+    tau_rep: float = 0.5
     representation_distance: str = "cosine"
+    infonce_temperature: float = 0.2
     loss_reduction: str = "mean"
 
     # Optimizer
@@ -216,7 +233,7 @@ class TrainConfig:
         if self.eval_batch_size is None:
             self.eval_batch_size = self.batch_size
         if self.num_classes is None:
-            self.num_classes = CLASS_COUNTS.get(self.dataset, 10)
+            self.num_classes = _default_num_classes(self.dataset)
         if self.distributed:
             self.local_rank = int(os.environ.get("LOCAL_RANK", self.local_rank))
             self.rank = int(os.environ.get("RANK", self.rank))
@@ -332,7 +349,9 @@ class TrainConfig:
         base = presets[self.loss_mode](
             tau_deg=self.tau_deg,
             tau_budget=self.tau_budget,
+            tau_rep=self.tau_rep,
             representation_distance=self.representation_distance,
+            infonce_temperature=self.infonce_temperature,
             inference_reduction=self.loss_reduction,
             dg_reduction=self.loss_reduction,
         )
@@ -351,7 +370,8 @@ class TrainConfig:
             inference_rec=term("inference_rec"), inference_rep=term("inference_rep"),
             dg_target=term("dg_target"), dg_budget=term("dg_budget"), dg_kl=term("dg_kl"),
             dg_rep=term("dg_rep"), dg_sparse=term("dg_sparse"), tau_deg=self.tau_deg,
-            tau_budget=self.tau_budget, representation_distance=self.representation_distance,
+            tau_budget=self.tau_budget, tau_rep=self.tau_rep, representation_distance=self.representation_distance,
+            infonce_temperature=self.infonce_temperature,
             inference_reduction=self.loss_reduction, dg_reduction=self.loss_reduction,
         )
 
@@ -378,6 +398,8 @@ class TrainConfig:
             ATTN_DROPOUT=self.attn_dropout,
             PROJ_DROPOUT=self.proj_dropout,
             DROP_PATH=self.drop_path,
+            DG_SPATIAL_REFINEMENT=self.dg_spatial_refinement,
+            DG_REFINEMENT_CHANNELS=self.dg_refinement_channels,
         )
 
 
@@ -398,7 +420,7 @@ def build_arg_parser(default_task: str = "dg_pretrain") -> argparse.ArgumentPars
     _add_bool_arg(parser, "deterministic", False, "deterministic backend settings")
     parser.add_argument("--device", default="auto")
 
-    parser.add_argument("--data-path", default="/home/cv202355545/dataset")
+    parser.add_argument("--data-path", default="/home/jeongyuseong/바탕화면/datasets")
     parser.add_argument("--dataset", default="STL10")
     parser.add_argument("--split", default="train")
     parser.add_argument("--val-split", default=None)
@@ -443,6 +465,8 @@ def build_arg_parser(default_task: str = "dg_pretrain") -> argparse.ArgumentPars
     parser.add_argument("--attn-dropout", type=float, default=0.0)
     parser.add_argument("--proj-dropout", type=float, default=0.0)
     parser.add_argument("--drop-path", type=float, default=0.0)
+    _add_bool_arg(parser, "dg-spatial-refinement", False, "enable full-image residual refinement")
+    parser.add_argument("--dg-refinement-channels", type=int, default=32)
 
     parser.add_argument("--loss-mode", choices=("representation_only", "reconstruction_only", "hybrid", "custom"), default="reconstruction_only")
     schedules = ("none", "linear", "cosine")
@@ -452,6 +476,7 @@ def build_arg_parser(default_task: str = "dg_pretrain") -> argparse.ArgumentPars
         parser.add_argument(f"--{term_name}-start", type=float, default=None)
         parser.add_argument(f"--{term_name}-end", type=float, default=None)
         parser.add_argument(f"--{term_name}-total-steps", type=int, default=None)
+    parser.add_argument("--dg-rep-target-weight", dest="dg_rep_weight", type=float)
     # Backward-compatible aliases; new scripts use the term-wise names.
     parser.add_argument("--alpha-inference", dest="inference_rec_weight", type=float)
     parser.add_argument("--alpha-target", dest="dg_target_weight", type=float)
@@ -459,7 +484,9 @@ def build_arg_parser(default_task: str = "dg_pretrain") -> argparse.ArgumentPars
     parser.add_argument("--lambda-reg", dest="dg_kl_weight", type=float)
     parser.add_argument("--tau-deg", type=float, default=0.05)
     parser.add_argument("--tau-budget", "--beta-mask", dest="tau_budget", type=float, default=0.01)
-    parser.add_argument("--representation-distance", choices=("cosine",), default="cosine")
+    parser.add_argument("--tau-rep", type=float, default=0.5)
+    parser.add_argument("--representation-distance", choices=("cosine", "infonce"), default="cosine")
+    parser.add_argument("--infonce-temperature", type=float, default=0.2)
     parser.add_argument("--loss-reduction", choices=("mean", "sum"), default="mean")
 
     parser.add_argument("--lr-inference", type=float, default=1.0e-3)

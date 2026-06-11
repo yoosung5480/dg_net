@@ -44,6 +44,40 @@ class RepresentationDistance(nn.Module):
         return _reduce(1.0 - cosine, self.reduction)
 
 
+class DGTargetRepresentationDistance(nn.Module):
+    """Keep each degraded representation at a target cosine distance."""
+
+    def __init__(self, tau_rep: float, eps: float = 1.0e-8, reduction: str = "mean") -> None:
+        super().__init__()
+        self.tau_rep, self.eps, self.reduction = tau_rep, eps, reduction
+
+    def forward(self, original: Tensor, degraded: Tensor) -> Tensor:
+        if original.shape != degraded.shape or original.ndim != 2:
+            raise ValueError("representations must be matching [B, D] tensors.")
+        cosine = F.cosine_similarity(original, degraded, dim=1, eps=self.eps)
+        per_image_distance = 1.0 - cosine
+        return _reduce((per_image_distance - self.tau_rep).abs(), self.reduction)
+
+
+class InfoNCELoss(nn.Module):
+    def __init__(self, temperature: float = 0.2) -> None:
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, original: Tensor, degraded: Tensor) -> Tensor:
+        if original.shape != degraded.shape or original.ndim != 2:
+            raise ValueError("representations must be matching [B, D] tensors.")
+        if original.shape[0] < 2:
+            raise ValueError("InfoNCE requires local batch size of at least 2.")
+        normalized_original = F.normalize(original, dim=1)
+        normalized_degraded = F.normalize(degraded, dim=1)
+        logits = normalized_original @ normalized_degraded.T / self.temperature
+        labels = torch.arange(original.shape[0], device=original.device)
+        loss_forward = F.cross_entropy(logits, labels)
+        loss_reverse = F.cross_entropy(logits.T, labels)
+        return 0.5 * (loss_forward + loss_reverse)
+
+
 class DGTargetDistance(nn.Module):
     def __init__(self, tau_deg: float, reduction: str = "mean") -> None:
         super().__init__()
@@ -132,11 +166,20 @@ class DGLoss(nn.Module):
         super().__init__()
         self.config = config
         self.rec = InferenceReconstructionLoss(config.inference_reduction)
-        self.rep = RepresentationDistance(config.eps, config.inference_reduction)
+        self.rep = self._build_representation_objective(config)
+        self.dg_rep_target = DGTargetRepresentationDistance(config.tau_rep, config.eps, config.dg_reduction)
         self.target = DGTargetDistance(config.tau_deg, config.dg_reduction)
         self.budget = DGBudgetDistance(config.tau_budget, config.dg_reduction)
         self.kl = ChannelWiseSpatialKL(config.eps, config.dg_reduction)
         self.sparse = SparsePenalty(config.eps, config.dg_reduction)
+
+    @staticmethod
+    def _build_representation_objective(config: LossConfig) -> nn.Module:
+        if config.representation_distance == "cosine":
+            return RepresentationDistance(config.eps, config.inference_reduction)
+        if config.representation_distance == "infonce":
+            return InfoNCELoss(config.infonce_temperature)
+        raise ValueError(f"Unsupported representation distance: {config.representation_distance!r}.")
 
     @staticmethod
     def _zero(reference: Tensor) -> Tensor:
@@ -181,7 +224,7 @@ class DGLoss(nn.Module):
         dg_target = self.target(reconstruction, original) if weights["dg_target"] else self._zero(original)
         dg_budget = self.budget(residual) if weights["dg_budget"] else self._zero(original)
         dg_kl = self.kl(residual) if weights["dg_kl"] else self._zero(original)
-        dg_rep = self.rep(z_original, z_degraded) if weights["dg_rep"] else self._zero(original)
+        dg_rep = self.dg_rep_target(z_original.detach(), z_degraded) if weights["dg_rep"] else self._zero(original)
         if weights["dg_sparse"] and mask is None:
             raise ValueError("dg_sparse is enabled but no explicit mask was provided.")
         dg_sparse = self.sparse(mask) if weights["dg_sparse"] else self._zero(original)
@@ -191,7 +234,7 @@ class DGLoss(nn.Module):
         weighted_dg_target = weights["dg_target"] * dg_target
         weighted_dg_budget = weights["dg_budget"] * dg_budget
         weighted_dg_kl = -weights["dg_kl"] * dg_kl
-        weighted_dg_rep = -weights["dg_rep"] * dg_rep
+        weighted_dg_rep = weights["dg_rep"] * dg_rep
         weighted_dg_sparse = weights["dg_sparse"] * dg_sparse
         inference_loss = weighted_inference_rec + weighted_inference_rep
         degradation_loss = weighted_dg_target + weighted_dg_budget + weighted_dg_kl + weighted_dg_rep + weighted_dg_sparse
@@ -218,11 +261,13 @@ def prepare_dgloss(config: LossConfig | None = None) -> DGLoss:
     return DGLoss(config or LossConfig())
 
 
+
 def write_loss_report(values: DGLossOutput, output_path: str | Path, *, heading: str = "DGNet loss verification") -> Path:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(heading + "\n" + "\n".join(f"{k}: {v:.10f}" for k, v in values.metrics().items()) + "\n", encoding="utf-8")
     return path
+
 
 
 def _fake_inputs() -> dict[str, Tensor]:
@@ -233,6 +278,7 @@ def _fake_inputs() -> dict[str, Tensor]:
         "reconstruction": (original + torch.randn_like(original) * 0.1).requires_grad_(),
         "z_original": torch.randn(4, 8), "z_degraded": torch.randn(4, 8, requires_grad=True),
     }
+
 
 
 def _self_test() -> Path:
@@ -247,6 +293,7 @@ def _self_test() -> Path:
         ("representation_only", LossConfig.representation_only()),
         ("reconstruction_only", LossConfig.reconstruction_only()),
         ("hybrid", LossConfig.hybrid()),
+        ("representation_only_infonce", LossConfig.representation_only(representation_distance="infonce")),
     ):
         values = prepare_dgloss(cfg)(**_fake_inputs(), step=50)
         assert values.combined_loss.ndim == 0 and torch.isfinite(values.combined_loss)
@@ -271,7 +318,7 @@ def _self_test() -> Path:
 
 __all__ = [
     "ChannelWiseSpatialKL", "DGBudgetDistance", "DGLoss", "DGLossOutput",
-    "DGTargetDistance", "InferenceReconstructionLoss", "LossConfig",
+    "DGTargetDistance", "DGTargetRepresentationDistance", "InferenceReconstructionLoss", "InfoNCELoss", "LossConfig",
     "RepresentationDistance", "SparsePenalty", "TermWeightConfig",
     "prepare_dgloss", "write_loss_report",
 ]

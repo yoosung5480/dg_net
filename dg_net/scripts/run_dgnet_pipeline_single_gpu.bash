@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Single-GPU DGNet pretrain -> linear probe one-shot script.
 # Usage:
-#   CUDA_DEVICE=4 DATA_PATH=/home/cv202355545/dataset bash scripts/run_dgnet_pipeline_single_gpu.bash
+#   CUDA_DEVICE=4 DATA_PATH=/home/jeongyuseong/바탕화면/datasets bash scripts/run_dgnet_pipeline_single_gpu.bash
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_ROOT="${SRC_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
@@ -25,6 +25,10 @@ EMBED_DIM="${EMBED_DIM:-192}"
 DEPTH="${DEPTH:-4}"
 NUM_HEADS="${NUM_HEADS:-3}"
 PROJECTION_DIM="${PROJECTION_DIM:-192}"
+REPRESENTATION_DISTANCE="${REPRESENTATION_DISTANCE:-cosine}"
+INFONCE_TEMPERATURE="${INFONCE_TEMPERATURE:-0.2}"
+DG_SPATIAL_REFINEMENT="${DG_SPATIAL_REFINEMENT:-false}"
+DG_REFINEMENT_CHANNELS="${DG_REFINEMENT_CHANNELS:-32}"
 
 PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-1}"
 LINEAR_EPOCHS="${LINEAR_EPOCHS:-1}"
@@ -76,9 +80,17 @@ COMMON_MODEL_ARGS=(
   --drop-path 0.1
 )
 
+REFINEMENT_ARGS=(--no-dg-spatial-refinement)
+if [[ "${DG_SPATIAL_REFINEMENT}" == "true" ]]; then
+  REFINEMENT_ARGS=(--dg-spatial-refinement)
+fi
+REFINEMENT_ARGS+=(--dg-refinement-channels "${DG_REFINEMENT_CHANNELS}")
+
 # Reconstruction-only baseline with term-wise schedules.
 LOSS_ARGS=(
   --loss-mode reconstruction_only
+  --representation-distance "${REPRESENTATION_DISTANCE}"
+  --infonce-temperature "${INFONCE_TEMPERATURE}"
   --inference-rec-weight 1.0
   --inference-rec-schedule none
   --inference-rep-weight 0.0
@@ -89,12 +101,13 @@ LOSS_ARGS=(
   --dg-budget-schedule none
   --dg-kl-weight 0.0
   --dg-kl-schedule none
-  --dg-rep-weight 0.0
+  --dg-rep-target-weight 0.0
   --dg-rep-schedule none
   --dg-sparse-weight 0.0
   --dg-sparse-schedule none
   --tau-deg 0.5
   --tau-budget 0.0
+  --tau-rep 0.5
   --loss-reduction mean
 )
 
@@ -110,6 +123,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" python engine/dg_train.py \
   --seed 42 \
   "${COMMON_DATA_ARGS[@]}" \
   "${COMMON_MODEL_ARGS[@]}" \
+  "${REFINEMENT_ARGS[@]}" \
   "${LOSS_ARGS[@]}" \
   --lr-inference 1.5e-4 \
   --lr-degradation 1.0e-4 \
@@ -133,6 +147,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" python engine/linear_probe_train.py \
   --seed 42 \
   "${COMMON_DATA_ARGS[@]}" \
   "${COMMON_MODEL_ARGS[@]}" \
+  "${REFINEMENT_ARGS[@]}" \
   --classifier-lr 1.0e-3 \
   --weight-decay 0.0
 

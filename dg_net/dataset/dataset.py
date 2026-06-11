@@ -24,10 +24,11 @@ except ImportError:  # pragma: no cover - direct-script compatibility
     from dataset_config import DataConfig
 
 
-SUPPORTED_DATASETS = ("STL10", "CIFAR100", "Flowers102", "iNaturalist", "Synthetic")
+SUPPORTED_DATASETS = ("STL10", "CIFAR100", "Flowers102", "iNaturalist", "ImageNet", "Synthetic")
 SUPPORTED_MODES = ("ssl", "classification")
 _DATASET_NAMES = {name.lower(): name for name in SUPPORTED_DATASETS}
 _DATASET_NAMES["inat"] = "iNaturalist"
+_DATASET_NAMES["imagefolder"] = "ImageNet"
 
 
 class MultiViewTransform:
@@ -64,8 +65,8 @@ def validate_config(cfg: DataConfig) -> Tuple[str, str]:
 
     name = _canonical_dataset(cfg.dataset)
     mode = _canonical_mode(cfg.mode)
-    if mode == "ssl" and name not in {"STL10", "Synthetic"}:
-        raise ValueError("SSL mode currently supports STL10 only (Synthetic is reserved for smoke tests).")
+    if mode == "ssl" and name not in {"STL10", "ImageNet", "Synthetic"}:
+        raise ValueError("SSL mode currently supports STL10 and ImageNet only (Synthetic is reserved for smoke tests).")
     if cfg.batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     if cfg.num_workers < 0:
@@ -130,6 +131,15 @@ def _flowers_split(split: str) -> str:
     return normalized
 
 
+def _imagenet_split(split: str) -> str:
+    normalized = split.strip().lower()
+    aliases = {"training": "train", "valid": "val", "validation": "val"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"train", "val", "test"}:
+        raise ValueError("ImageNet split must be 'train' or 'val'.")
+    return "val" if normalized == "test" else normalized
+
+
 def _inaturalist_version(cfg: DataConfig) -> str:
     if cfg.inaturalist_version:
         return cfg.inaturalist_version
@@ -153,6 +163,10 @@ def _resolve_root(cfg: DataConfig, name: str, mode: str) -> str:
     """Support either a torchvision root or the project's shared dataset directory."""
 
     root = Path(cfg.data_path).expanduser()
+    if name == "ImageNet":
+        split = "train" if mode == "ssl" else _imagenet_split(cfg.split)
+        candidate = root / split
+        return str(candidate if candidate.is_dir() else root)
     if name != "STL10":
         return str(root)
     partition = "train" if mode == "ssl" or cfg.split.strip().lower() == "train" else "val"
@@ -171,13 +185,15 @@ def _resolve_root(cfg: DataConfig, name: str, mode: str) -> str:
 
 def _effective_split(cfg: DataConfig, name: str, mode: str) -> str:
     if mode == "ssl":
-        return "unlabeled"
+        return "unlabeled" if name == "STL10" else "train"
     if name == "CIFAR100":
         return "train" if _is_train_split(cfg.split) else "test"
     if name == "Flowers102":
         return _flowers_split(cfg.split)
     if name == "iNaturalist":
         return _inaturalist_version(cfg)
+    if name == "ImageNet":
+        return "train" if mode == "ssl" else _imagenet_split(cfg.split)
     return cfg.split
 
 
@@ -232,6 +248,8 @@ def prepare_dataset(cfg: DataConfig) -> Dataset[Any]:
         dataset = datasets.Flowers102(
             root=root, split=_flowers_split(cfg.split), download=cfg.download, transform=transform
         )
+    elif name == "ImageNet":
+        dataset = datasets.ImageFolder(root=root, transform=transform)
     else:
         dataset = datasets.INaturalist(
             root=root,
