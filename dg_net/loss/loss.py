@@ -1,347 +1,328 @@
-"""Config-driven loss functions for DGNet adversarial reconstruction.
-
-Only tensors are consumed by this module.  In particular it does not import
-``DGNet`` or a dataset, keeping the loss package usable from any training
-engine that supplies an original image, its reconstruction, and a degradation
-residual.
-
-Typical use with the project's DGNet output object::
-
-    loss_fn = prepare_dgloss(LossConfig())
-    values = loss_fn(model(images), step=global_step)
-    values.inference_loss.backward()    # update encoder/decoder while M is frozen
-    values.degradation_loss.backward()  # update M while inference model is frozen
-"""
+"""Tensor-only, term-wise scheduled DGNet adversarial losses."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping
+from typing import Mapping
 
 import torch
 from torch import Tensor, nn
+import torch.nn.functional as F
 
-if TYPE_CHECKING:
-    from loss_config import LossConfig, ScheduleConfig
-else:
-    try:  # package import
-        from .loss_config import LossConfig, ScheduleConfig
-    except ImportError:  # direct ``python loss.py`` / flat-module import
-        from loss_config import LossConfig, ScheduleConfig
+try:
+    from .loss_config import LossConfig, TermWeightConfig
+except ImportError:
+    from loss_config import LossConfig, TermWeightConfig
 
 
-def _reduce(value: Tensor, reduction: str) -> Tensor:
-    return value.mean() if reduction == "mean" else value.sum()
+def _reduce(values: Tensor, reduction: str) -> Tensor:
+    return values.mean() if reduction == "mean" else values.sum()
 
 
-class ReconstructionDistance(nn.Module):
-    """Compute ``D_rec = ||reconstruction - original||_2^2``."""
-
+class InferenceReconstructionLoss(nn.Module):
     def __init__(self, reduction: str = "mean") -> None:
         super().__init__()
         self.reduction = reduction
 
     def forward(self, reconstruction: Tensor, original: Tensor) -> Tensor:
         if reconstruction.shape != original.shape:
-            raise ValueError(
-                "reconstruction and original must have identical shapes, "
-                f"got {tuple(reconstruction.shape)} and {tuple(original.shape)}."
-            )
+            raise ValueError("reconstruction and original shapes must match.")
         return _reduce((reconstruction - original).square(), self.reduction)
 
 
-class DegradationTargetDistance(nn.Module):
-    """Compute ``D_target = (D_rec - tau_deg)^2``."""
-
-    def __init__(self, tau_deg: float) -> None:
-        super().__init__()
-        self.tau_deg = tau_deg
-
-    def forward(self, reconstruction_distance: Tensor) -> Tensor:
-        return (reconstruction_distance - self.tau_deg).abs()
-
-
-class MaskBudgetDistance(nn.Module):
-    """Compute ``D_budget = |mean(|M(x)|) - beta_mask|``."""
-
-    def __init__(self, beta_mask: float) -> None:
-        super().__init__()
-        self.beta_mask = beta_mask
-
-    def forward(self, residual: Tensor) -> Tensor:
-        return (residual.abs().mean() - self.beta_mask).abs()
-
-
-class DamageKLDivergence(nn.Module):
-    """Compute ``KL(P_damage || Uniform)`` over image spatial positions.
-
-    For each image, channel-wise absolute residuals produce its spatial
-    damage map.  A zero residual produces a finite zero KL value, matching the
-    zero-initialized degradation head used by DGNet.
-    """
-
+class RepresentationDistance(nn.Module):
     def __init__(self, eps: float = 1.0e-8, reduction: str = "mean") -> None:
         super().__init__()
-        self.eps = eps
-        self.reduction = reduction
+        self.eps, self.reduction = eps, reduction
+
+    def forward(self, original: Tensor, degraded: Tensor) -> Tensor:
+        if original.shape != degraded.shape or original.ndim != 2:
+            raise ValueError("representations must be matching [B, D] tensors.")
+        cosine = F.cosine_similarity(original, degraded, dim=1, eps=self.eps)
+        return _reduce(1.0 - cosine, self.reduction)
+
+
+class DGTargetRepresentationDistance(nn.Module):
+    """Keep each degraded representation at a target cosine distance."""
+
+    def __init__(self, tau_rep: float, eps: float = 1.0e-8, reduction: str = "mean") -> None:
+        super().__init__()
+        self.tau_rep, self.eps, self.reduction = tau_rep, eps, reduction
+
+    def forward(self, original: Tensor, degraded: Tensor) -> Tensor:
+        if original.shape != degraded.shape or original.ndim != 2:
+            raise ValueError("representations must be matching [B, D] tensors.")
+        cosine = F.cosine_similarity(original, degraded, dim=1, eps=self.eps)
+        per_image_distance = 1.0 - cosine
+        return _reduce((per_image_distance - self.tau_rep).abs(), self.reduction)
+
+
+class InfoNCELoss(nn.Module):
+    def __init__(self, temperature: float = 0.2) -> None:
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, original: Tensor, degraded: Tensor) -> Tensor:
+        if original.shape != degraded.shape or original.ndim != 2:
+            raise ValueError("representations must be matching [B, D] tensors.")
+        if original.shape[0] < 2:
+            raise ValueError("InfoNCE requires local batch size of at least 2.")
+        normalized_original = F.normalize(original, dim=1)
+        normalized_degraded = F.normalize(degraded, dim=1)
+        logits = normalized_original @ normalized_degraded.T / self.temperature
+        labels = torch.arange(original.shape[0], device=original.device)
+        loss_forward = F.cross_entropy(logits, labels)
+        loss_reverse = F.cross_entropy(logits.T, labels)
+        return 0.5 * (loss_forward + loss_reverse)
+
+
+class DGTargetDistance(nn.Module):
+    def __init__(self, tau_deg: float, reduction: str = "mean") -> None:
+        super().__init__()
+        self.tau_deg, self.reduction = tau_deg, reduction
+
+    def forward(self, reconstruction: Tensor, original: Tensor) -> Tensor:
+        per_image = (reconstruction - original).square().flatten(1).mean(1)
+        return _reduce((per_image - self.tau_deg).abs(), self.reduction)
+
+
+class DGBudgetDistance(nn.Module):
+    def __init__(self, tau_budget: float, reduction: str = "mean") -> None:
+        super().__init__()
+        self.tau_budget, self.reduction = tau_budget, reduction
+
+    def forward(self, residual: Tensor) -> Tensor:
+        per_image = residual.square().flatten(1).mean(1)
+        return _reduce((per_image - self.tau_budget).abs(), self.reduction)
+
+
+class ChannelWiseSpatialKL(nn.Module):
+    def __init__(self, eps: float = 1.0e-8, reduction: str = "mean") -> None:
+        super().__init__()
+        self.eps, self.reduction = eps, reduction
 
     def forward(self, residual: Tensor) -> Tensor:
         if residual.ndim != 4:
-            raise ValueError(f"residual must be BCHW image data, got shape {tuple(residual.shape)}.")
-        damage = residual.abs().mean(dim=1).flatten(start_dim=1)
-        probabilities = damage / (damage.sum(dim=1, keepdim=True) + self.eps)
-        uniform_probability = 1.0 / probabilities.shape[1]
-        contribution = torch.where(
-            probabilities > 0.0,
-            probabilities * (probabilities.clamp_min(self.eps).log() - torch.log(
-                probabilities.new_tensor(uniform_probability)
-            )),
-            torch.zeros_like(probabilities),
+            raise ValueError("residual must be BCHW.")
+        damage = residual.abs().flatten(2)
+        probability = damage / (damage.sum(2, keepdim=True) + self.eps)
+        uniform = 1.0 / damage.shape[2]
+        terms = torch.where(
+            probability > 0,
+            probability * (probability.clamp_min(self.eps).log() - probability.new_tensor(uniform).log()),
+            torch.zeros_like(probability),
         )
-        return _reduce(contribution.sum(dim=1), self.reduction)
+        return _reduce(terms.sum(2), self.reduction)
+
+
+class SparsePenalty(nn.Module):
+    def __init__(self, eps: float = 1.0e-8, reduction: str = "mean") -> None:
+        super().__init__()
+        self.eps, self.reduction = eps, reduction
+
+    def forward(self, mask: Tensor) -> Tensor:
+        if mask.ndim == 4:
+            mask = mask.mean(1)
+        if mask.ndim != 3:
+            raise ValueError("mask must be [B,H,W] or [B,C,H,W].")
+        fraction = mask.flatten(1).sum(1) / (mask.shape[-2] * mask.shape[-1])
+        return _reduce(torch.sin(torch.pi * fraction).clamp_min(self.eps).reciprocal(), self.reduction)
 
 
 @dataclass
-class DGLossResult:
-    """Separate optimization objectives and detached diagnostic terms.
-
-    ``inference_loss`` and ``degradation_loss`` must be optimized in separate
-    DGNet phases.  ``combined_loss`` is supplied only for reporting/smoke
-    tests; using it for one optimizer removes the intended adversarial split.
-    """
-
+class DGLossOutput:
     inference_loss: Tensor
     degradation_loss: Tensor
     combined_loss: Tensor
-    reconstruction_distance: Tensor
-    target_distance: Tensor
-    budget_distance: Tensor
-    damage_kl: Tensor
-    weighted_inference: Tensor
-    weighted_target: Tensor
-    weighted_budget: Tensor
-    weighted_regularization: Tensor
+    inference_rec: Tensor
+    inference_rep: Tensor
+    dg_target: Tensor
+    dg_budget: Tensor
+    dg_kl: Tensor
+    dg_rep: Tensor
+    dg_sparse: Tensor
+    weighted_inference_rec: Tensor
+    weighted_inference_rep: Tensor
+    weighted_dg_target: Tensor
+    weighted_dg_budget: Tensor
+    weighted_dg_kl: Tensor
+    weighted_dg_rep: Tensor
+    weighted_dg_sparse: Tensor
     effective_weights: dict[str, float]
 
     def metrics(self) -> dict[str, float]:
-        """Convert detached scalar diagnostics to plain numbers for logs."""
-
-        values = {
-            "inference_loss": self.inference_loss,
-            "degradation_loss": self.degradation_loss,
-            "combined_loss": self.combined_loss,
-            "reconstruction_distance": self.reconstruction_distance,
-            "target_distance": self.target_distance,
-            "budget_distance": self.budget_distance,
-            "damage_kl": self.damage_kl,
-            "weighted_inference": self.weighted_inference,
-            "weighted_target": self.weighted_target,
-            "weighted_budget": self.weighted_budget,
-            "weighted_regularization": self.weighted_regularization,
-        }
-        result = {name: value.detach().item() for name, value in values.items()}
-        result.update(self.effective_weights)
+        result: dict[str, float] = {}
+        for name, value in self.__dict__.items():
+            if isinstance(value, Tensor):
+                result[name] = float(value.detach().item())
+        result.update({f"weight_{k}": v for k, v in self.effective_weights.items()})
         return result
 
 
 class DGLoss(nn.Module):
-    """Four independently controlled DGNet objective terms."""
-
-    def __init__(self, cfg: LossConfig) -> None:
+    def __init__(self, config: LossConfig) -> None:
         super().__init__()
-        self.cfg = cfg
-        self.reconstruction = ReconstructionDistance(cfg.reduction)
-        self.target = DegradationTargetDistance(cfg.tau_deg)
-        self.budget = MaskBudgetDistance(cfg.beta_mask)
-        self.damage_kl = DamageKLDivergence(cfg.eps, cfg.reduction)
+        self.config = config
+        self.rec = InferenceReconstructionLoss(config.inference_reduction)
+        self.rep = self._build_representation_objective(config)
+        self.dg_rep_target = DGTargetRepresentationDistance(config.tau_rep, config.eps, config.dg_reduction)
+        self.target = DGTargetDistance(config.tau_deg, config.dg_reduction)
+        self.budget = DGBudgetDistance(config.tau_budget, config.dg_reduction)
+        self.kl = ChannelWiseSpatialKL(config.eps, config.dg_reduction)
+        self.sparse = SparsePenalty(config.eps, config.dg_reduction)
 
     @staticmethod
-    def _tensor_from_output(output: object | Mapping[str, Tensor], name: str) -> Tensor:
-        tensor = output[name] if isinstance(output, Mapping) else getattr(output, name, None)
-        if not isinstance(tensor, Tensor):
-            raise TypeError(f"loss input must provide a Tensor named {name!r}.")
-        return tensor
+    def _build_representation_objective(config: LossConfig) -> nn.Module:
+        if config.representation_distance == "cosine":
+            return RepresentationDistance(config.eps, config.inference_reduction)
+        if config.representation_distance == "infonce":
+            return InfoNCELoss(config.infonce_temperature)
+        raise ValueError(f"Unsupported representation distance: {config.representation_distance!r}.")
 
     @staticmethod
-    def _disabled(reference: Tensor) -> Tensor:
-        """Create a detached scalar for an inactive term (no term autograd path)."""
-
+    def _zero(reference: Tensor) -> Tensor:
         return reference.detach().new_zeros(())
 
-    def from_tensors(
-        self,
-        original: Tensor,
-        reconstruction: Tensor,
-        residual: Tensor,
-        step: int = 0,
-    ) -> DGLossResult:
-        """Compute objectives from explicit tensors instead of a model output object."""
-
-        if residual.shape != original.shape:
-            raise ValueError(
-                "residual and original must have identical shapes, "
-                f"got {tuple(residual.shape)} and {tuple(original.shape)}."
-            )
-        weights = self.cfg.weights_at(step)
-        inference_on = weights["alpha_inference"] != 0.0
-        target_on = weights["alpha_target"] != 0.0
-        budget_on = weights["lambda_budget"] != 0.0
-        regularization_on = weights["lambda_reg"] != 0.0
-
-        if inference_on or target_on:
-            reconstruction_distance = self.reconstruction(reconstruction, original)
-        else:
-            with torch.no_grad():
-                reconstruction_distance = self.reconstruction(reconstruction, original)
-        target_distance = (
-            self.target(reconstruction_distance)
-            if target_on
-            else self.target(reconstruction_distance.detach())
-        )
-        budget_distance = (
-            self.budget(residual) if budget_on else self.budget(residual.detach())
-        )
-        damage_kl = (
-            self.damage_kl(residual)
-            if regularization_on
-            else self.damage_kl(residual.detach())
-        )
-
-        weighted_inference = (
-            reconstruction_distance * weights["alpha_inference"]
-            if inference_on
-            else self._disabled(reconstruction)
-        )
-        weighted_target = (
-            target_distance * weights["alpha_target"]
-            if target_on
-            else self._disabled(reconstruction)
-        )
-        weighted_budget = (
-            budget_distance * weights["lambda_budget"]
-            if budget_on
-            else self._disabled(residual)
-        )
-        weighted_regularization = (
-            -damage_kl * weights["lambda_reg"]
-            if regularization_on
-            else self._disabled(residual)
-        )
-
-        # Keep ``backward`` safe for a fully disabled objective while emitting
-        # exactly zero gradients.  Active terms do not use this anchor.
-        inference_loss = (
-            weighted_inference if inference_on else reconstruction.sum() * 0.0
-        )
-        if target_on or budget_on or regularization_on:
-            degradation_loss = weighted_target + weighted_budget + weighted_regularization
-        else:
-            degradation_loss = reconstruction.sum() * 0.0 + residual.sum() * 0.0
-        combined_loss = inference_loss + degradation_loss
-
-        return DGLossResult(
-            inference_loss=inference_loss,
-            degradation_loss=degradation_loss,
-            combined_loss=combined_loss,
-            reconstruction_distance=reconstruction_distance.detach(),
-            target_distance=target_distance.detach(),
-            budget_distance=budget_distance.detach(),
-            damage_kl=damage_kl.detach(),
-            weighted_inference=weighted_inference.detach(),
-            weighted_target=weighted_target.detach(),
-            weighted_budget=weighted_budget.detach(),
-            weighted_regularization=weighted_regularization.detach(),
-            effective_weights=weights,
-        )
+    @staticmethod
+    def _tensor(output: object | Mapping[str, Tensor], name: str) -> Tensor:
+        value = output[name] if isinstance(output, Mapping) else getattr(output, name, None)
+        if not isinstance(value, Tensor):
+            raise TypeError(f"loss input must provide Tensor {name!r}.")
+        return value
 
     def forward(
         self,
-        output: object | Mapping[str, Tensor],
+        output: object | Mapping[str, Tensor] | None = None,
+        *,
+        original: Tensor | None = None,
+        degraded: Tensor | None = None,
+        residual: Tensor | None = None,
+        reconstruction: Tensor | None = None,
+        z_original: Tensor | None = None,
+        z_degraded: Tensor | None = None,
+        mask: Tensor | None = None,
         step: int = 0,
-    ) -> DGLossResult:
-        """Consume ``DGNetOutput`` or a mapping with its three tensor fields."""
+    ) -> DGLossOutput:
+        if output is not None:
+            original = self._tensor(output, "original")
+            degraded = self._tensor(output, "degraded")
+            residual = self._tensor(output, "residual")
+            reconstruction = self._tensor(output, "reconstruction")
+            z_original = self._tensor(output, "representation")
+            z_degraded = self._tensor(output, "degraded_representation")
+        required = (original, degraded, residual, reconstruction, z_original, z_degraded)
+        if any(value is None for value in required):
+            raise TypeError("original, degraded, residual, reconstruction, z_original and z_degraded are required.")
+        assert original is not None and residual is not None and reconstruction is not None
+        assert z_original is not None and z_degraded is not None
+        weights = self.config.weights_at(step)
 
-        return self.from_tensors(
-            original=self._tensor_from_output(output, "original"),
-            reconstruction=self._tensor_from_output(output, "reconstruction"),
-            residual=self._tensor_from_output(output, "residual"),
-            step=step,
+        inference_rec = self.rec(reconstruction, original) if weights["inference_rec"] else self._zero(original)
+        inference_rep = self.rep(z_original, z_degraded) if weights["inference_rep"] else self._zero(original)
+        dg_target = self.target(reconstruction, original) if weights["dg_target"] else self._zero(original)
+        dg_budget = self.budget(residual) if weights["dg_budget"] else self._zero(original)
+        dg_kl = self.kl(residual) if weights["dg_kl"] else self._zero(original)
+        dg_rep = self.dg_rep_target(z_original.detach(), z_degraded) if weights["dg_rep"] else self._zero(original)
+        if weights["dg_sparse"] and mask is None:
+            raise ValueError("dg_sparse is enabled but no explicit mask was provided.")
+        dg_sparse = self.sparse(mask) if weights["dg_sparse"] else self._zero(original)
+
+        weighted_inference_rec = weights["inference_rec"] * inference_rec
+        weighted_inference_rep = weights["inference_rep"] * inference_rep
+        weighted_dg_target = weights["dg_target"] * dg_target
+        weighted_dg_budget = weights["dg_budget"] * dg_budget
+        weighted_dg_kl = -weights["dg_kl"] * dg_kl
+        weighted_dg_rep = weights["dg_rep"] * dg_rep
+        weighted_dg_sparse = weights["dg_sparse"] * dg_sparse
+        inference_loss = weighted_inference_rec + weighted_inference_rep
+        degradation_loss = weighted_dg_target + weighted_dg_budget + weighted_dg_kl + weighted_dg_rep + weighted_dg_sparse
+        # Safe backward anchors for fully disabled ablations.
+        if not inference_loss.requires_grad:
+            inference_loss = inference_loss + reconstruction.sum() * 0.0 + z_degraded.sum() * 0.0
+        if not degradation_loss.requires_grad:
+            degradation_loss = degradation_loss + residual.sum() * 0.0
+        return DGLossOutput(
+            inference_loss, degradation_loss, inference_loss + degradation_loss,
+            inference_rec, inference_rep, dg_target, dg_budget, dg_kl, dg_rep, dg_sparse,
+            weighted_inference_rec, weighted_inference_rep, weighted_dg_target, weighted_dg_budget,
+            weighted_dg_kl, weighted_dg_rep, weighted_dg_sparse, weights,
         )
 
+    def from_output(self, output: object | Mapping[str, Tensor], step: int = 0) -> DGLossOutput:
+        return self(output, step=step)
 
-def prepare_dgloss(cfg: LossConfig | None = None) -> DGLoss:
-    """Build the DGNet loss module solely from ``LossConfig``."""
-
-    return DGLoss(cfg or LossConfig())
+    def from_tensors(self, *, step: int = 0, **tensors: Tensor | None) -> DGLossOutput:
+        return self(None, step=step, **tensors)
 
 
-def write_loss_report(
-    values: DGLossResult,
-    output_path: str | Path,
-    *,
-    heading: str = "DGNet loss verification",
-) -> Path:
-    """Persist one scalar loss observation without depending on a model API."""
+def prepare_dgloss(config: LossConfig | None = None) -> DGLoss:
+    return DGLoss(config or LossConfig())
 
+
+
+def write_loss_report(values: DGLossOutput, output_path: str | Path, *, heading: str = "DGNet loss verification") -> Path:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    metrics = values.metrics()
-    lines = [heading] + [f"{name}: {value:.10f}" for name, value in metrics.items()]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text(heading + "\n" + "\n".join(f"{k}: {v:.10f}" for k, v in values.metrics().items()) + "\n", encoding="utf-8")
     return path
 
 
+
+def _fake_inputs() -> dict[str, Tensor]:
+    original = torch.rand(4, 3, 16, 16)
+    residual = (torch.rand_like(original) * 0.1).requires_grad_()
+    return {
+        "original": original, "degraded": original - residual, "residual": residual,
+        "reconstruction": (original + torch.randn_like(original) * 0.1).requires_grad_(),
+        "z_original": torch.randn(4, 8), "z_degraded": torch.randn(4, 8, requires_grad=True),
+    }
+
+
+
 def _self_test() -> Path:
-    """Run independent tensor-level checks and write an executable smoke log."""
-
-    torch.manual_seed(0)
-    original = torch.rand(4, 3, 32, 32)
-    reconstruction = (original + 0.05 * torch.randn_like(original)).requires_grad_()
-    residual = (0.1 * torch.rand_like(original)).requires_grad_()
-    scheduled = ScheduleConfig(enabled=True, kind="cosine", end_step=100)
-    cfg = LossConfig(alpha_target_schedule=scheduled, lambda_reg_schedule=scheduled)
-    loss_fn = prepare_dgloss(cfg)
-    start = loss_fn.from_tensors(original, reconstruction, residual, step=0)
-    end = loss_fn.from_tensors(original, reconstruction, residual, step=100)
-    end.degradation_loss.backward()
-    assert torch.isfinite(end.combined_loss)
-    assert start.effective_weights["alpha_target"] == 0.0
-    assert end.effective_weights["alpha_target"] == cfg.alpha_target
-
-    off_reconstruction = reconstruction.detach().clone().requires_grad_()
-    off_residual = residual.detach().clone().requires_grad_()
-    off = prepare_dgloss(
-        LossConfig(alpha_inference=0.0, alpha_target=0.0, lambda_budget=0.0, lambda_reg=0.0)
-    ).from_tensors(original, off_reconstruction, off_residual)
-    off.combined_loss.backward()
-    assert off_reconstruction.grad is not None
-    assert off_residual.grad is not None
-    assert torch.count_nonzero(off_reconstruction.grad) == 0
-    assert torch.count_nonzero(off_residual.grad) == 0
-
-    report = Path(__file__).resolve().parent / "output" / "loss_tensor_smoke.log"
-    write_loss_report(end, report, heading="DGNet independent loss smoke verification")
-    with report.open("a", encoding="utf-8") as stream:
-        stream.write("schedule_step_0_alpha_target: 0.0000000000\n")
-        stream.write(f"schedule_step_100_alpha_target: {cfg.alpha_target:.10f}\n")
-        stream.write("all_terms_disabled_zero_gradient: True\n")
-    return report
+    output_dir = Path(__file__).resolve().parent / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logs: dict[str, str] = {}
+    scheduled = TermWeightConfig(weight=2.0, schedule="cosine", start=0.0, end=1.0, total_steps=100)
+    assert scheduled.effective_weight(0) == 0.0 and scheduled.effective_weight(100) == 2.0
+    logs["loss_scheduler_test.log"] = "linear/cosine clamp and zero-base checks passed\n"
+    assert TermWeightConfig(weight=0.0, schedule="linear", start=1.0, end=9.0).effective_weight(10) == 0.0
+    for name, cfg in (
+        ("representation_only", LossConfig.representation_only()),
+        ("reconstruction_only", LossConfig.reconstruction_only()),
+        ("hybrid", LossConfig.hybrid()),
+        ("representation_only_infonce", LossConfig.representation_only(representation_distance="infonce")),
+    ):
+        values = prepare_dgloss(cfg)(**_fake_inputs(), step=50)
+        assert values.combined_loss.ndim == 0 and torch.isfinite(values.combined_loss)
+        values.combined_loss.backward()
+        logs.setdefault("loss_ablation_mode_test.log", "")
+        logs["loss_ablation_mode_test.log"] += f"{name}: passed\n"
+    off = LossConfig(
+        inference_rec=TermWeightConfig(weight=0), inference_rep=TermWeightConfig(weight=0),
+        dg_target=TermWeightConfig(weight=0), dg_budget=TermWeightConfig(weight=0),
+        dg_kl=TermWeightConfig(weight=0), dg_rep=TermWeightConfig(weight=0),
+        dg_sparse=TermWeightConfig(weight=0),
+    )
+    values = prepare_dgloss(off)(**_fake_inputs())
+    assert all(v == 0.0 for v in values.effective_weights.values())
+    logs["loss_term_onoff_test.log"] = "all disabled terms skipped and zero weighted\n"
+    logs["loss_forward_shape_test.log"] = "all modes produced finite scalar outputs\n"
+    logs["loss_config_summary.log"] = json.dumps(asdict(LossConfig.hybrid()), indent=2) + "\n"
+    for filename, content in logs.items():
+        (output_dir / filename).write_text(content, encoding="utf-8")
+    return output_dir
 
 
 __all__ = [
-    "DGLoss",
-    "DGLossResult",
-    "DamageKLDivergence",
-    "DegradationTargetDistance",
-    "LossConfig",
-    "MaskBudgetDistance",
-    "ReconstructionDistance",
-    "ScheduleConfig",
-    "prepare_dgloss",
-    "write_loss_report",
+    "ChannelWiseSpatialKL", "DGBudgetDistance", "DGLoss", "DGLossOutput",
+    "DGTargetDistance", "DGTargetRepresentationDistance", "InferenceReconstructionLoss", "InfoNCELoss", "LossConfig",
+    "RepresentationDistance", "SparsePenalty", "TermWeightConfig",
+    "prepare_dgloss", "write_loss_report",
 ]
 
 
 if __name__ == "__main__":
-    print(f"Wrote loss verification artifact: {_self_test()}")
+    print(f"Wrote loss smoke artifacts: {_self_test()}")

@@ -1,169 +1,127 @@
-"""Configuration surface for DGNet's adversarial reconstruction losses.
-
-This module deliberately contains no model or dataset imports.  The training
-engine can build one :class:`LossConfig` and pass it to
-``loss.prepare_dgloss`` without coupling the loss package to DGNet internals.
-"""
+"""Independent configuration and scheduling for every DGNet loss term."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import cos, pi
 from typing import Literal
 
 
-ScheduleKind = Literal["linear", "cosine"]
+ScheduleKind = Literal["none", "linear", "cosine"]
+RepresentationDistanceKind = Literal["cosine", "infonce"]
 
 
 @dataclass(frozen=True)
-class ScheduleConfig:
-    """Optional scalar schedule applied to exactly one loss coefficient.
+class TermWeightConfig:
+    """Base coefficient and multiplicative schedule for one loss term."""
 
-    A schedule multiplies its term's configured base coefficient.  Thus a
-    coefficient set to ``0.0`` remains exactly zero even when scheduling is
-    enabled, which is important when ablation experiments turn terms off.
-    """
-
-    # ``False`` leaves the coefficient unchanged.  Switching a schedule on
-    # therefore needs no change to loss code, only a config update.
-    enabled: bool = False
-
-    # Interpolation curve for the multiplicative factor.  ``linear`` changes
-    # at a constant rate; ``cosine`` starts and finishes smoothly.
-    kind: ScheduleKind = "linear"
-
-    # First global optimization step affected by interpolation.  Before this
-    # step the scheduler emits ``start_factor``.
-    start_step: int = 0
-
-    # Step at which interpolation is complete.  At and after this step the
-    # scheduler emits ``end_factor``.
-    end_step: int = 100
-
-    # Multiplier at ``start_step``.  Use ``0.0`` for a term warm-up, or
-    # ``1.0`` when annealing a term down from its configured base coefficient.
-    start_factor: float = 0.0
-
-    # Multiplier at ``end_step``.  Use ``1.0`` for warm-up and ``0.0`` for
-    # scheduled removal of a term.
-    end_factor: float = 1.0
+    weight: float = 1.0
+    schedule: ScheduleKind = "none"
+    start: float = 1.0
+    end: float = 1.0
+    total_steps: int = 10000
 
     def __post_init__(self) -> None:
-        if self.kind not in ("linear", "cosine"):
-            raise ValueError("ScheduleConfig.kind must be 'linear' or 'cosine'.")
-        if self.start_step < 0:
-            raise ValueError("ScheduleConfig.start_step must be non-negative.")
-        if self.end_step <= self.start_step:
-            raise ValueError("ScheduleConfig.end_step must be greater than start_step.")
-        if self.start_factor < 0.0 or self.end_factor < 0.0:
-            raise ValueError("Schedule factors must be non-negative.")
+        if self.weight < 0.0:
+            raise ValueError("TermWeightConfig.weight must be non-negative.")
+        if self.schedule not in ("none", "linear", "cosine"):
+            raise ValueError("schedule must be one of: none, linear, cosine.")
+        if self.total_steps <= 0:
+            raise ValueError("total_steps must be positive.")
 
-    def factor_at(self, step: int) -> float:
-        """Return this schedule's coefficient multiplier at ``step``."""
-
+    def effective_weight(self, step: int = 0) -> float:
         if step < 0:
-            raise ValueError("Loss step must be non-negative.")
-        if not self.enabled:
-            return 1.0
-        progress = min(max((step - self.start_step) / (self.end_step - self.start_step), 0.0), 1.0)
-        if self.kind == "cosine":
-            progress = 0.5 * (1.0 - cos(pi * progress))
-        return self.start_factor + (self.end_factor - self.start_factor) * progress
+            raise ValueError("step must be non-negative.")
+        if self.weight == 0.0:
+            return 0.0
+        if self.schedule == "none":
+            return self.weight
+        progress = min(max(step / self.total_steps, 0.0), 1.0)
+        if self.schedule == "cosine":
+            factor = self.end + 0.5 * (self.start - self.end) * (1.0 + cos(pi * progress))
+        else:
+            factor = self.start + (self.end - self.start) * progress
+        return self.weight * factor
+
+
+
+def _term(weight: float = 0.0) -> TermWeightConfig:
+    return TermWeightConfig(weight=weight)
 
 
 @dataclass(frozen=True)
 class LossConfig:
-    """All hyperparameters controlling the DGNet loss construction.
+    """Tensor-only DGNet adversarial objective configuration."""
 
-    Four separately switchable terms are used:
-
-    ``alpha_inference * D_rec``
-        Reconstruction objective optimized for the inference encoder/decoder.
-    ``alpha_target * (D_rec - tau_deg)^2``
-        Difficulty-matching objective optimized for the degradation network.
-    ``lambda_budget * |mean(|M(x)|) - beta_mask|``
-        Residual magnitude budget objective for the degradation network.
-    ``-lambda_reg * KL(P_damage || U)``
-        Anti-collapse objective encouraging localized rather than uniform
-        brightness damage.
-
-    Set any term coefficient to exactly ``0.0`` to disable that term.  The
-    loss implementation then does not include that term in the autograd
-    objective, so that disabled term contributes no gradient.
-    """
-
-    # Coefficient on inference reconstruction loss D_rec.  It belongs to the
-    # inference/decoder optimizer objective, not the degradation objective.
-    alpha_inference: float = 1.0
-
-    # Coefficient on degradation target loss (D_rec - tau_deg)^2.  Set to
-    # zero when testing the budget or regularization terms in isolation.
-    alpha_target: float = 1.0
-
-    # Coefficient on the residual magnitude budget penalty.  Larger values
-    # make M(x)'s mean absolute residual adhere more tightly to beta_mask.
-    lambda_budget: float = 1.0
-
-    # Coefficient on KL anti-collapse regularization.  The implementation
-    # inserts this as ``-lambda_reg * KL`` because the degradation optimizer
-    # minimizes its loss while it should maximize non-uniformity.
-    lambda_reg: float = 0.1
-
-    # Desired reconstruction difficulty for the degradation network.  Since
-    # the default reconstruction reduction is mean squared error, this is a
-    # target mean per-pixel reconstruction error by default.
-    tau_deg: float = 0.25
-
-    # Desired average absolute magnitude of the image-shaped degradation
-    # residual M(x).  It bounds how much damage the degradation model uses.
-    beta_mask: float = 0.15
-
-    # Numerical stabilizer in P_damage = A / (sum(A) + eps) and its log.
-    # It keeps zero-initialized residuals finite during the first forward.
+    inference_rec: TermWeightConfig = field(default_factory=lambda: _term(1.0))
+    inference_rep: TermWeightConfig = field(default_factory=lambda: _term(0.0))
+    dg_target: TermWeightConfig = field(default_factory=lambda: _term(1.0))
+    dg_budget: TermWeightConfig = field(default_factory=lambda: _term(1.0))
+    dg_kl: TermWeightConfig = field(default_factory=lambda: _term(0.0))
+    dg_rep: TermWeightConfig = field(default_factory=lambda: _term(0.0))
+    dg_sparse: TermWeightConfig = field(default_factory=lambda: _term(0.0))
+    tau_deg: float = 0.05
+    tau_budget: float = 0.01
+    tau_rep: float = 0.5
+    representation_distance: RepresentationDistanceKind = "cosine"
+    infonce_temperature: float = 0.2
     eps: float = 1.0e-8
-
-    # Scalar reduction for D_rec and per-image KL: ``"mean"`` is stable when
-    # batch/image size changes; ``"sum"`` reproduces an unnormalized squared
-    # L2 sum and requires correspondingly scaled tau_deg.
-    reduction: Literal["mean", "sum"] = "mean"
-
-    # Optional schedule for alpha_inference.  By default the reconstruction
-    # learner begins at full strength without scheduling.
-    alpha_inference_schedule: ScheduleConfig = ScheduleConfig()
-
-    # Optional schedule for alpha_target.  For adversarial warm-up, set
-    # enabled=True with factors 0 -> 1 over the desired number of steps.
-    alpha_target_schedule: ScheduleConfig = ScheduleConfig()
-
-    # Optional schedule for lambda_budget, useful when first allowing M(x) to
-    # explore then gradually enforcing its magnitude budget.
-    lambda_budget_schedule: ScheduleConfig = ScheduleConfig()
-
-    # Optional schedule for lambda_reg, useful for introducing anti-collapse
-    # pressure after a target-difficulty warm-up period.
-    lambda_reg_schedule: ScheduleConfig = ScheduleConfig()
+    inference_reduction: Literal["mean", "sum"] = "mean"
+    dg_reduction: Literal["mean", "sum"] = "mean"
 
     def __post_init__(self) -> None:
-        coefficient_names = ("alpha_inference", "alpha_target", "lambda_budget", "lambda_reg")
-        for name in coefficient_names:
-            if getattr(self, name) < 0.0:
-                raise ValueError(f"{name} must be non-negative.")
-        if self.tau_deg < 0.0 or self.beta_mask < 0.0:
-            raise ValueError("tau_deg and beta_mask must be non-negative.")
+        if self.tau_deg < 0.0 or self.tau_budget < 0.0:
+            raise ValueError("tau_deg and tau_budget must be non-negative.")
+        if not 0.0 < self.tau_rep <= 2.0:
+            raise ValueError("tau_rep must be in the cosine-distance range (0, 2].")
         if self.eps <= 0.0:
             raise ValueError("eps must be positive.")
-        if self.reduction not in ("mean", "sum"):
-            raise ValueError("reduction must be 'mean' or 'sum'.")
+        if self.representation_distance not in ("cosine", "infonce"):
+            raise ValueError("representation_distance must be 'cosine' or 'infonce'.")
+        if self.infonce_temperature <= 0.0:
+            raise ValueError("infonce_temperature must be positive.")
+        if self.inference_reduction not in ("mean", "sum") or self.dg_reduction not in ("mean", "sum"):
+            raise ValueError("reductions must be 'mean' or 'sum'.")
+
+    @classmethod
+    def representation_only(cls, **kwargs: object) -> "LossConfig":
+        return cls(
+            inference_rec=_term(0.0), inference_rep=_term(1.0),
+            dg_target=_term(0.0), dg_budget=_term(0.0), dg_kl=_term(0.0),
+            dg_rep=_term(1.0), dg_sparse=_term(0.0), **kwargs,
+        )
+
+    @classmethod
+    def reconstruction_only(cls, **kwargs: object) -> "LossConfig":
+        return cls(
+            inference_rec=_term(1.0), inference_rep=_term(0.0),
+            dg_target=_term(1.0), dg_budget=_term(1.0), dg_kl=_term(0.01),
+            dg_rep=_term(0.0), dg_sparse=_term(0.0), **kwargs,
+        )
+
+    @classmethod
+    def hybrid(cls, **kwargs: object) -> "LossConfig":
+        return cls(
+            inference_rec=_term(1.0), inference_rep=_term(1.0),
+            dg_target=_term(1.0), dg_budget=_term(1.0), dg_kl=_term(0.01),
+            dg_rep=_term(1.0), dg_sparse=_term(0.0), **kwargs,
+        )
 
     def weights_at(self, step: int = 0) -> dict[str, float]:
-        """Return effective term weights after applying all selected schedules."""
-
         return {
-            "alpha_inference": self.alpha_inference * self.alpha_inference_schedule.factor_at(step),
-            "alpha_target": self.alpha_target * self.alpha_target_schedule.factor_at(step),
-            "lambda_budget": self.lambda_budget * self.lambda_budget_schedule.factor_at(step),
-            "lambda_reg": self.lambda_reg * self.lambda_reg_schedule.factor_at(step),
+            name: getattr(self, name).effective_weight(step)
+            for name in (
+                "inference_rec", "inference_rep", "dg_target", "dg_budget",
+                "dg_kl", "dg_rep", "dg_sparse",
+            )
         }
 
 
-__all__ = ["LossConfig", "ScheduleConfig", "ScheduleKind"]
+
+def effective_weight(config: TermWeightConfig, step: int = 0) -> float:
+    return config.effective_weight(step)
+
+
+__all__ = [
+    "LossConfig", "RepresentationDistanceKind", "ScheduleKind", "TermWeightConfig", "effective_weight",
+]

@@ -36,11 +36,16 @@ DataConfig 사용 설명
   - ``split="train"``은 기본적으로 torchvision ``version="2021_train"``을 사용한다.
   - ``split="val"``/``"validation"``은 ``version="2021_valid"``를 사용한다.
   - 다른 torchvision 제공 release를 사용하려면 ``inaturalist_version``을 직접 지정한다.
+* ``dataset="ImageNet"`` 또는 alias ``"imagenet"``/``"imagefolder"``
+  - ``mode="ssl"``: ``data_path/train``이 있으면 그 ImageFolder를, 없으면 ``data_path`` 자체를 사용한다.
+  - ``mode="classification"``: ``split="train"``이면 ``data_path/train``을,
+    ``split="val"``/``"validation"``이면 ``data_path/val``을 우선 사용한다.
+  - 위 하위 디렉터리가 없으면 ``data_path`` 자체를 ImageFolder root로 사용한다.
 
 필드별 사용법
 -------------
 * ``data_path``: 데이터 저장 상위 디렉터리. 본 프로젝트의 공통 경로
-  ``/home/cv202355545/dataset``를 넣으면 STL10의 경우
+  ``/home/jeongyuseong/바탕화면/datasets``를 넣으면 STL10의 경우
   ``stl10/train/stl10_binary`` 또는 평가용 하위 경로를 자동 탐색한다.
 * ``download``: torchvision에 없는 파일을 다운로드할지 결정한다. 서버/오프라인
   환경에서는 이미 준비된 데이터와 ``False`` 사용을 권장한다.
@@ -92,15 +97,15 @@ SSL 확인 스크립트이다. 첫 번째 논리 줄에서 config를 만들고, 
 class DataConfig:
     """All user-controlled inputs needed to build one dataloader.
 
-    ``mode="ssl"`` is intentionally restricted to STL10, whose unlabeled
-    split is used for pretraining. Classification mode supports every dataset
+    ``mode="ssl"`` supports STL10 unlabeled pretraining plus ImageNet
+    ImageFolder pretraining. Classification mode supports every dataset
     listed in :mod:`dataset.md`.
     """
 
-    dataset: str = "STL10"  # "STL10", "CIFAR100", "Flowers102", "iNaturalist"
-    data_path: str = "/home/cv202355545/dataset"
+    dataset: str = "STL10"  # "STL10", "CIFAR100", "Flowers102", "iNaturalist", "ImageNet"
+    data_path: str = "/home/jeongyuseong/바탕화면/datasets"
     mode: str = "ssl"  # "ssl" or "classification"
-    split: str = "train"  # STL10: train/test; CIFAR100: train/test; Flowers102: train/val/test; iNaturalist: train/val
+    split: str = "train"  # STL10: train/test; CIFAR100: train/test; Flowers102: train/val/test; iNaturalist: train/val; ImageNet: train/val
     download: bool = False
     classes: Optional[List[int]] = None
     max_samples: Optional[int] = None

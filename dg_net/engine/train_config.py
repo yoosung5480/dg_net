@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import random
 import sys
+import os
 from typing import Any, Iterable, Optional
 
 import numpy as np
@@ -26,13 +27,26 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataset import DataConfig  # noqa: E402
-from loss.loss_config import LossConfig, ScheduleConfig  # noqa: E402
+from loss.loss_config import LossConfig, TermWeightConfig  # noqa: E402
 from model.dg_model import DgNetConfig  # noqa: E402
 
 
 TASKS = ("dg_pretrain", "linear_probe", "knn_eval", "finetune", "eval")
 LOOP_MODES = ("step", "epoch")
-CLASS_COUNTS = {"STL10": 10, "CIFAR100": 100, "Flowers102": 102, "iNaturalist": 10000}
+CLASS_COUNTS = {
+    "stl10": 10,
+    "cifar100": 100,
+    "flowers102": 102,
+    "inaturalist": 10000,
+    "inat": 10000,
+    "imagenet": 1000,
+    "imagefolder": 1000,
+    "synthetic": 10,
+}
+
+
+def _default_num_classes(dataset: str) -> int:
+    return CLASS_COUNTS.get(dataset.strip().lower(), 10)
 
 
 def _parse_tuple(value: str | Iterable[float] | None, *, length: int = 3) -> tuple[float, ...] | None:
@@ -85,7 +99,7 @@ class TrainConfig:
 
     # Dataset
     dataset: str = "STL10"
-    data_path: str = "/home/cv202355545/dataset"
+    data_path: str = "/home/jeongyuseong/바탕화면/datasets"
     split: str = "train"
     val_split: Optional[str] = None
     download: bool = False
@@ -104,6 +118,10 @@ class TrainConfig:
     drop_last: bool = True
     pin_memory: bool = False
     persistent_workers: bool = False
+    distributed: bool = False
+    local_rank: int = 0
+    rank: int = 0
+    world_size: int = 1
 
     # Model
     patch_size: int = 8
@@ -126,14 +144,51 @@ class TrainConfig:
     attn_dropout: float = 0.0
     proj_dropout: float = 0.0
     drop_path: float = 0.0
+    dg_spatial_refinement: bool = False
+    dg_refinement_channels: int = 32
 
-    # Loss
-    alpha_inference: float = 1.0
-    alpha_target: float = 1.0
-    lambda_budget: float = 1.0
-    lambda_reg: float = 0.1
-    tau_deg: float = 0.25
-    beta_mask: float = 0.15
+    # Loss: None means keep the selected mode preset value.
+    loss_mode: str = "reconstruction_only"
+    inference_rec_weight: Optional[float] = None
+    inference_rec_schedule: Optional[str] = None
+    inference_rec_start: Optional[float] = None
+    inference_rec_end: Optional[float] = None
+    inference_rec_total_steps: Optional[int] = None
+    inference_rep_weight: Optional[float] = None
+    inference_rep_schedule: Optional[str] = None
+    inference_rep_start: Optional[float] = None
+    inference_rep_end: Optional[float] = None
+    inference_rep_total_steps: Optional[int] = None
+    dg_target_weight: Optional[float] = None
+    dg_target_schedule: Optional[str] = None
+    dg_target_start: Optional[float] = None
+    dg_target_end: Optional[float] = None
+    dg_target_total_steps: Optional[int] = None
+    dg_budget_weight: Optional[float] = None
+    dg_budget_schedule: Optional[str] = None
+    dg_budget_start: Optional[float] = None
+    dg_budget_end: Optional[float] = None
+    dg_budget_total_steps: Optional[int] = None
+    dg_kl_weight: Optional[float] = None
+    dg_kl_schedule: Optional[str] = None
+    dg_kl_start: Optional[float] = None
+    dg_kl_end: Optional[float] = None
+    dg_kl_total_steps: Optional[int] = None
+    dg_rep_weight: Optional[float] = None
+    dg_rep_schedule: Optional[str] = None
+    dg_rep_start: Optional[float] = None
+    dg_rep_end: Optional[float] = None
+    dg_rep_total_steps: Optional[int] = None
+    dg_sparse_weight: Optional[float] = None
+    dg_sparse_schedule: Optional[str] = None
+    dg_sparse_start: Optional[float] = None
+    dg_sparse_end: Optional[float] = None
+    dg_sparse_total_steps: Optional[int] = None
+    tau_deg: float = 0.05
+    tau_budget: float = 0.01
+    tau_rep: float = 0.5
+    representation_distance: str = "cosine"
+    infonce_temperature: float = 0.2
     loss_reduction: str = "mean"
 
     # Optimizer
@@ -165,6 +220,8 @@ class TrainConfig:
             raise ValueError(f"task must be one of {TASKS}, got {self.task!r}")
         if self.loop_mode not in LOOP_MODES:
             raise ValueError(f"loop_mode must be one of {LOOP_MODES}, got {self.loop_mode!r}")
+        if self.loss_mode not in {"representation_only", "reconstruction_only", "hybrid", "custom"}:
+            raise ValueError("invalid loss_mode")
         if self.total_steps < 0 or self.total_epochs < 0:
             raise ValueError("total_steps and total_epochs must be non-negative")
         if self.img_size != int(self.img_size) or self.patch_size != int(self.patch_size):
@@ -176,7 +233,11 @@ class TrainConfig:
         if self.eval_batch_size is None:
             self.eval_batch_size = self.batch_size
         if self.num_classes is None:
-            self.num_classes = CLASS_COUNTS.get(self.dataset, 10)
+            self.num_classes = _default_num_classes(self.dataset)
+        if self.distributed:
+            self.local_rank = int(os.environ.get("LOCAL_RANK", self.local_rank))
+            self.rank = int(os.environ.get("RANK", self.rank))
+            self.world_size = int(os.environ.get("WORLD_SIZE", self.world_size))
         self.mean = tuple(float(x) for x in self.mean)  # type: ignore[assignment]
         self.std = tuple(float(x) for x in self.std)  # type: ignore[assignment]
         self.crop_scale = tuple(float(x) for x in self.crop_scale)  # type: ignore[assignment]
@@ -194,6 +255,8 @@ class TrainConfig:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__ and v is not None})
 
     def resolve_device(self) -> torch.device:
+        if self.distributed:
+            return torch.device("cuda", self.local_rank)
         if self.device == "auto":
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(self.device)
@@ -226,6 +289,9 @@ class TrainConfig:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["resolved_device"] = str(self.resolve_device())
+        data["model_config"] = asdict(self.build_model_config())
+        data["loss_config"] = asdict(self.build_loss_config())
+        data["data_config"] = asdict(self.build_data_config(train=True))
         return data
 
     def write_json(self, path: str | Path) -> Path:
@@ -260,29 +326,53 @@ class TrainConfig:
             persistent_workers=self.persistent_workers,
             seed=self.seed + (0 if train else 1000),
             output_dir=str(Path(self.output_dir or self.output_root) / "dataset_reports"),
-            write_report=True,
+            write_report=(not self.distributed or self.rank == 0),
+            distributed=self.distributed,
+            rank=self.rank,
+            world_size=self.world_size,
         )
 
     def _default_val_split(self) -> str:
-        if self.dataset in {"CIFAR100", "STL10"}:
+        if self.dataset in {"CIFAR100", "STL10", "Synthetic"}:
             return "test"
         if self.dataset == "Flowers102":
             return "val"
         return "val"
 
     def build_loss_config(self) -> LossConfig:
-        return LossConfig(
-            alpha_inference=self.alpha_inference,
-            alpha_target=self.alpha_target,
-            lambda_budget=self.lambda_budget,
-            lambda_reg=self.lambda_reg,
+        presets = {
+            "representation_only": LossConfig.representation_only,
+            "reconstruction_only": LossConfig.reconstruction_only,
+            "hybrid": LossConfig.hybrid,
+            "custom": LossConfig,
+        }
+        base = presets[self.loss_mode](
             tau_deg=self.tau_deg,
-            beta_mask=self.beta_mask,
-            reduction=self.loss_reduction,  # type: ignore[arg-type]
-            alpha_inference_schedule=ScheduleConfig(),
-            alpha_target_schedule=ScheduleConfig(),
-            lambda_budget_schedule=ScheduleConfig(),
-            lambda_reg_schedule=ScheduleConfig(),
+            tau_budget=self.tau_budget,
+            tau_rep=self.tau_rep,
+            representation_distance=self.representation_distance,
+            infonce_temperature=self.infonce_temperature,
+            inference_reduction=self.loss_reduction,
+            dg_reduction=self.loss_reduction,
+        )
+
+        def term(name: str) -> TermWeightConfig:
+            current = getattr(base, name)
+            return TermWeightConfig(
+                weight=getattr(self, f"{name}_weight") if getattr(self, f"{name}_weight") is not None else current.weight,
+                schedule=getattr(self, f"{name}_schedule") or current.schedule,
+                start=getattr(self, f"{name}_start") if getattr(self, f"{name}_start") is not None else current.start,
+                end=getattr(self, f"{name}_end") if getattr(self, f"{name}_end") is not None else current.end,
+                total_steps=getattr(self, f"{name}_total_steps") or current.total_steps,
+            )
+
+        return LossConfig(
+            inference_rec=term("inference_rec"), inference_rep=term("inference_rep"),
+            dg_target=term("dg_target"), dg_budget=term("dg_budget"), dg_kl=term("dg_kl"),
+            dg_rep=term("dg_rep"), dg_sparse=term("dg_sparse"), tau_deg=self.tau_deg,
+            tau_budget=self.tau_budget, tau_rep=self.tau_rep, representation_distance=self.representation_distance,
+            infonce_temperature=self.infonce_temperature,
+            inference_reduction=self.loss_reduction, dg_reduction=self.loss_reduction,
         )
 
     def build_model_config(self) -> DgNetConfig:
@@ -308,6 +398,8 @@ class TrainConfig:
             ATTN_DROPOUT=self.attn_dropout,
             PROJ_DROPOUT=self.proj_dropout,
             DROP_PATH=self.drop_path,
+            DG_SPATIAL_REFINEMENT=self.dg_spatial_refinement,
+            DG_REFINEMENT_CHANNELS=self.dg_refinement_channels,
         )
 
 
@@ -328,7 +420,7 @@ def build_arg_parser(default_task: str = "dg_pretrain") -> argparse.ArgumentPars
     _add_bool_arg(parser, "deterministic", False, "deterministic backend settings")
     parser.add_argument("--device", default="auto")
 
-    parser.add_argument("--data-path", default="/home/cv202355545/dataset")
+    parser.add_argument("--data-path", default="/home/jeongyuseong/바탕화면/datasets")
     parser.add_argument("--dataset", default="STL10")
     parser.add_argument("--split", default="train")
     parser.add_argument("--val-split", default=None)
@@ -348,6 +440,10 @@ def build_arg_parser(default_task: str = "dg_pretrain") -> argparse.ArgumentPars
     _add_bool_arg(parser, "drop-last", True, "drop last incomplete train batch")
     _add_bool_arg(parser, "pin-memory", False, "DataLoader pin memory")
     _add_bool_arg(parser, "persistent-workers", False, "persistent DataLoader workers")
+    _add_bool_arg(parser, "distributed", False, "torchrun DistributedDataParallel")
+    parser.add_argument("--local-rank", type=int, default=0)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--world-size", type=int, default=1)
 
     parser.add_argument("--patch-size", type=int, default=8)
     parser.add_argument("--embed-dim", type=int, default=64)
@@ -369,13 +465,28 @@ def build_arg_parser(default_task: str = "dg_pretrain") -> argparse.ArgumentPars
     parser.add_argument("--attn-dropout", type=float, default=0.0)
     parser.add_argument("--proj-dropout", type=float, default=0.0)
     parser.add_argument("--drop-path", type=float, default=0.0)
+    _add_bool_arg(parser, "dg-spatial-refinement", False, "enable full-image residual refinement")
+    parser.add_argument("--dg-refinement-channels", type=int, default=32)
 
-    parser.add_argument("--alpha-inference", type=float, default=1.0)
-    parser.add_argument("--alpha-target", type=float, default=1.0)
-    parser.add_argument("--lambda-budget", type=float, default=1.0)
-    parser.add_argument("--lambda-reg", type=float, default=0.1)
-    parser.add_argument("--tau-deg", type=float, default=0.25)
-    parser.add_argument("--beta-mask", type=float, default=0.15)
+    parser.add_argument("--loss-mode", choices=("representation_only", "reconstruction_only", "hybrid", "custom"), default="reconstruction_only")
+    schedules = ("none", "linear", "cosine")
+    for term_name in ("inference-rec", "inference-rep", "dg-target", "dg-budget", "dg-kl", "dg-rep", "dg-sparse"):
+        parser.add_argument(f"--{term_name}-weight", type=float, default=None)
+        parser.add_argument(f"--{term_name}-schedule", choices=schedules, default=None)
+        parser.add_argument(f"--{term_name}-start", type=float, default=None)
+        parser.add_argument(f"--{term_name}-end", type=float, default=None)
+        parser.add_argument(f"--{term_name}-total-steps", type=int, default=None)
+    parser.add_argument("--dg-rep-target-weight", dest="dg_rep_weight", type=float)
+    # Backward-compatible aliases; new scripts use the term-wise names.
+    parser.add_argument("--alpha-inference", dest="inference_rec_weight", type=float)
+    parser.add_argument("--alpha-target", dest="dg_target_weight", type=float)
+    parser.add_argument("--lambda-budget", dest="dg_budget_weight", type=float)
+    parser.add_argument("--lambda-reg", dest="dg_kl_weight", type=float)
+    parser.add_argument("--tau-deg", type=float, default=0.05)
+    parser.add_argument("--tau-budget", "--beta-mask", dest="tau_budget", type=float, default=0.01)
+    parser.add_argument("--tau-rep", type=float, default=0.5)
+    parser.add_argument("--representation-distance", choices=("cosine", "infonce"), default="cosine")
+    parser.add_argument("--infonce-temperature", type=float, default=0.2)
     parser.add_argument("--loss-reduction", choices=("mean", "sum"), default="mean")
 
     parser.add_argument("--lr-inference", type=float, default=1.0e-3)
